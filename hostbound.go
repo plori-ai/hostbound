@@ -115,8 +115,9 @@ func (p *Proxy) Serve(ln net.Listener) error { return p.impl.serve(ln) }
 
 // Grant makes the binding accept placeholder in addition to its Placeholder until
 // revoke is called. placeholder must differ from every binding's Placeholder and
-// from every placeholder granted and not yet revoked. revoke can be called more
-// than once.
+// from every placeholder granted and not yet revoked. revoke also cancels every
+// request that is still in progress and received the token through this grant. revoke
+// can be called more than once.
 func (p *Proxy) Grant(bindingID, placeholder string) (revoke func(), err error) {
 	return p.impl.grant(bindingID, placeholder)
 }

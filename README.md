@@ -120,6 +120,7 @@ If it returns an error, the proxy refuses the request and does not call `Token`.
 A `*Refusal` error sets the status, headers and body of the response.
 
 `Grant` gives a binding an extra placeholder until the caller revokes it.
+Revoking a grant also cancels the requests in progress that received the credential through it.
 A `Check` function can then allow some requests only with a granted placeholder.
 For example, an application can give a command that a person approved its own placeholder, and refuse write requests that present the usual placeholder.
 

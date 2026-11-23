@@ -28,9 +28,13 @@ const (
 	recentTokens     = 4
 )
 
+var errGrantRevoked = errors.New("grant revoked")
+
+type grant map[*exchange]struct{}
+
 type binding struct {
 	Binding
-	grants map[string]bool // Guarded by proxy.grantsMu.
+	grants map[string]grant // Guarded by proxy.grantsMu.
 	mu     sync.Mutex
 	recent []string
 }
@@ -46,14 +50,20 @@ func (p *proxy) grant(bindingID, placeholder string) (func(), error) {
 	p.grantsMu.Lock()
 	defer p.grantsMu.Unlock()
 	for _, other := range p.bindings {
-		if placeholder == other.Placeholder || other.grants[placeholder] {
+		if placeholder == other.Placeholder || other.grants[placeholder] != nil {
 			return nil, errors.New("hostbound: grant placeholder is already in use")
 		}
 	}
-	b.grants[placeholder] = true
+	b.grants[placeholder] = make(grant)
 	return sync.OnceFunc(func() {
 		p.grantsMu.Lock()
 		defer p.grantsMu.Unlock()
+		for x := range b.grants[placeholder] {
+			x.cancel(errGrantRevoked)
+			if x.bodyController != nil {
+				_ = x.bodyController.SetReadDeadline(time.Now())
+			}
+		}
 		delete(b.grants, placeholder)
 	}), nil
 }
@@ -90,7 +100,7 @@ func (b *binding) scanPairs(current string) []secretPair {
 type proxy struct {
 	cfg       Config
 	bindings  map[string]*binding
-	grantsMu  sync.RWMutex
+	grantsMu  sync.Mutex
 	hosts     map[string][]*binding
 	ca        *authority
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -135,7 +145,7 @@ func newProxy(cfg Config) (*Proxy, error) {
 			}
 			seen[inj] = true
 		}
-		bb := &binding{Binding: b, grants: make(map[string]bool)}
+		bb := &binding{Binding: b, grants: make(map[string]grant)}
 		p.bindings[b.ID] = bb
 		for _, h := range b.Hosts {
 			n, port, ok := parseAuthority(h)
@@ -432,10 +442,14 @@ func closeWrite(c net.Conn) {
 }
 
 type exchange struct {
-	bs         []*binding
-	injections map[*binding]matchedInjection
-	use        Use
-	recorded   bool
+	bs             []*binding
+	injections     map[*binding]matchedInjection
+	grants         []grant
+	grantCtx       context.Context
+	cancel         context.CancelCauseFunc
+	bodyController *http.ResponseController
+	use            Use
+	recorded       bool
 }
 
 type matchedInjection struct {
@@ -447,17 +461,33 @@ type presentedBinding struct {
 	b         *binding
 	form      Injection
 	presented string
+	inject    bool
 }
 
-func (p *proxy) match(x *exchange, h http.Header) []presentedBinding {
-	p.grantsMu.RLock()
-	defer p.grantsMu.RUnlock()
+func (p *proxy) match(x *exchange, r *http.Request, w http.ResponseWriter) []presentedBinding {
+	p.grantsMu.Lock()
+	defer p.grantsMu.Unlock()
 	var matches []presentedBinding
+	headers := make(map[string]bool)
 	for _, b := range x.bs {
-		form, presented, granted := b.match(h)
-		if presented != "" {
-			matches = append(matches, presentedBinding{b, form, presented})
-			x.use.Granted = x.use.Granted || granted
+		form, presented, granted := b.match(r.Header)
+		if presented == "" {
+			continue
+		}
+		header := form.headerName()
+		inject := !headers[header]
+		headers[header] = true
+		matches = append(matches, presentedBinding{b, form, presented, inject})
+		x.use.Granted = x.use.Granted || granted
+		if g := b.grants[presented]; inject && g != nil {
+			if x.grantCtx == nil {
+				x.grantCtx, x.cancel = context.WithCancelCause(r.Context())
+				if r.Body != nil && r.Body != http.NoBody {
+					x.bodyController = http.NewResponseController(w)
+				}
+			}
+			g[x] = struct{}{}
+			x.grants = append(x.grants, g)
 		}
 	}
 	return matches
@@ -480,6 +510,17 @@ func (x *exchange) scanPairs() []secretPair {
 }
 
 func (p *proxy) finish(x *exchange) {
+	if x.grantCtx != nil {
+		p.grantsMu.Lock()
+		for _, g := range x.grants {
+			delete(g, x)
+		}
+		if context.Cause(x.grantCtx) == errGrantRevoked {
+			x.use.Err = errGrantRevoked.Error()
+		}
+		p.grantsMu.Unlock()
+		x.cancel(nil)
+	}
 	if !x.recorded {
 		x.recorded = true
 		p.record(x.use)
@@ -491,6 +532,14 @@ type exchangeKey struct{}
 func (x *exchange) fail(w http.ResponseWriter, code int, msg string) {
 	x.use.Status, x.use.Err = code, msg
 	http.Error(w, http.StatusText(code), code)
+}
+
+func (x *exchange) failIfRevoked(w http.ResponseWriter) bool {
+	if x.grantCtx == nil || context.Cause(x.grantCtx) != errGrantRevoked {
+		return false
+	}
+	x.fail(w, http.StatusBadGateway, errGrantRevoked.Error())
+	return true
 }
 
 func (x *exchange) refuse(w http.ResponseWriter, err error) {
@@ -540,7 +589,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 		x.fail(w, http.StatusMisdirectedRequest, "request authority does not match CONNECT host")
 		return
 	}
-	matches := p.match(x, r.Header)
+	matches := p.match(x, r, w)
+	if x.grantCtx != nil {
+		r = r.WithContext(x.grantCtx)
+	}
 	var refusal error
 	for _, m := range matches {
 		if m.b.Check != nil {
@@ -553,17 +605,20 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 		x.refuse(w, refusal)
 		return
 	}
+	if x.failIfRevoked(w) {
+		return
+	}
 	var injected []*binding
-	headers := make(map[string]bool)
 	for _, m := range matches {
-		header := m.form.headerName()
-		if headers[header] {
+		if !m.inject {
 			continue
 		}
-		headers[header] = true
 		b := m.b
 		injected = append(injected, b)
 		token, err := b.Token(r.Context())
+		if x.failIfRevoked(w) {
+			return
+		}
 		if err != nil || token == "" {
 			x.use.BindingID = bindingIDs(injected)
 			x.fail(w, http.StatusBadGateway, "token unavailable")
@@ -623,7 +678,7 @@ func (p *proxy) modifyResponse(resp *http.Response) error {
 		}
 	}
 	x.use.Status = resp.StatusCode
-	if resp.StatusCode == http.StatusSwitchingProtocols {
+	if resp.StatusCode == http.StatusSwitchingProtocols && x.grantCtx == nil {
 		p.finish(x)
 	}
 	return nil

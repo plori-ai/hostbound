@@ -1427,6 +1427,13 @@ func TestGrantLifetime(t *testing.T) {
 	check("GET", grant, realToken, true)
 	check("GET", other.Placeholder, other.Placeholder, false)
 	check("POST", grant, realToken, true)
+	impl := h.proxy.impl
+	impl.grantsMu.Lock()
+	active := len(impl.bindings[b.ID].grants[grant])
+	impl.grantsMu.Unlock()
+	if active != 0 {
+		t.Fatalf("live grant retained %d completed requests", active)
+	}
 	revoke()
 	check("POST", grant, grant, false)
 	revokeAgain, err := h.proxy.Grant(b.ID, grant)
@@ -1442,7 +1449,8 @@ func TestGrantLifetime(t *testing.T) {
 func TestGrantDuringRequest(t *testing.T) {
 	const grant = "shared-grant"
 	ca := newTestCA(t)
-	first := headerBinding(staticToken(nil))
+	var tokens atomic.Int32
+	first := headerBinding(staticToken(&tokens))
 	second := basicBinding(staticToken(nil))
 	up := startUpstream(t, ca, boundHost, nil)
 	other := startUpstream(t, ca, basicHost, nil)
@@ -1456,10 +1464,9 @@ func TestGrantDuringRequest(t *testing.T) {
 		close(entered)
 		select {
 		case <-resume:
-			return nil
 		case <-r.Context().Done():
-			return r.Context().Err()
 		}
+		return nil
 	}
 	h := startProxy(t, Config{Bindings: []Binding{first, second}}, ca.pool, map[string]string{
 		boundHost + ":443": up.srv.Listener.Addr().String(), basicHost + ":443": other.srv.Listener.Addr().String(),
@@ -1469,7 +1476,7 @@ func TestGrantDuringRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := h.client(true, h.caPool)
-	request := func(host string, form Injection) error {
+	request := func(host string, form Injection, wantStatus int) error {
 		req, _ := http.NewRequest(http.MethodGet, "https://"+host+"/", nil)
 		req.Header.Set(form.headerName(), form.value(grant))
 		resp, err := client.Do(req)
@@ -1477,19 +1484,19 @@ func TestGrantDuringRequest(t *testing.T) {
 			return err
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode != wantStatus {
 			return fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		return nil
 	}
-	if err := request(basicHost, basicInjection); err != nil {
+	if err := request(basicHost, basicInjection, http.StatusOK); err != nil {
 		t.Fatal(err)
 	}
 	if u := h.nextUse(); u.Granted || u.Injected {
 		t.Fatalf("grant matched on another binding: %+v", u)
 	}
 	done := make(chan error, 1)
-	go func() { done <- request(boundHost, bearerInjection) }()
+	go func() { done <- request(boundHost, bearerInjection, http.StatusBadGateway) }()
 	select {
 	case <-entered:
 	case err := <-done:
@@ -1516,21 +1523,247 @@ func TestGrantDuringRequest(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if u := h.nextUse(); !u.Granted || !u.Injected || checks.Load() != 1 {
+	if u := h.nextUse(); !u.Granted || u.Injected || u.Err != "grant revoked" || checks.Load() != 1 || tokens.Load() != 0 {
 		t.Fatalf("in-flight request: %+v, Check calls %d", u, checks.Load())
 	}
-	if err := request(boundHost, bearerInjection); err != nil {
+	if err := request(boundHost, bearerInjection, http.StatusOK); err != nil {
 		t.Fatal(err)
 	}
 	if u := h.nextUse(); u.Granted || u.Injected || checks.Load() != 1 {
 		t.Fatalf("revoked request: %+v, Check calls %d", u, checks.Load())
 	}
-	if err := request(basicHost, basicInjection); err != nil {
+	if err := request(basicHost, basicInjection, http.StatusOK); err != nil {
 		t.Fatal(err)
 	}
 	if u := h.nextUse(); !u.Granted || !u.Injected {
 		t.Fatalf("reassigned grant: %+v", u)
 	}
+}
+
+func TestRevokeStopsUpload(t *testing.T) {
+	const placeholderGrant = "upload-grant"
+	for _, clientH2 := range []bool{false, true} {
+		for _, upstreamH2 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("clientH2=%t/upstreamH2=%t", clientH2, upstreamH2), func(t *testing.T) {
+				ca := newTestCA(t)
+				headers := make(chan string, 1)
+				read := make(chan string, 1)
+				up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					headers <- r.Header.Get("Authorization")
+					body, _ := io.ReadAll(r.Body)
+					read <- string(body)
+				}))
+				up.EnableHTTP2 = upstreamH2
+				up.TLS = &tls.Config{Certificates: []tls.Certificate{ca.leaf(t, boundHost)}}
+				up.StartTLS()
+				t.Cleanup(up.Close)
+
+				tokenContext := make(chan context.Context, 1)
+				b := headerBinding(func(ctx context.Context) (string, error) {
+					tokenContext <- ctx
+					return realToken, nil
+				})
+				b.Check = func(r *http.Request, presented string) error {
+					if r.Method != http.MethodGet && presented != placeholderGrant {
+						return errors.New("write requires grant")
+					}
+					return nil
+				}
+				h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.Listener.Addr().String()})
+				revoke, err := h.proxy.Grant(b.ID, placeholderGrant)
+				if err != nil {
+					t.Fatal(err)
+				}
+				client := h.client(clientH2, h.caPool)
+				pr, pw := io.Pipe()
+				defer pw.Close()
+				req, _ := http.NewRequest(http.MethodPut, "https://"+boundHost+"/upload", pr)
+				req.Header.Set("Authorization", bearerInjection.value(placeholderGrant))
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					resp, err := client.Do(req)
+					if err == nil {
+						resp.Body.Close()
+					}
+				}()
+				select {
+				case auth := <-headers:
+					if auth != bearerInjection.value(realToken) {
+						t.Fatal("upstream did not receive the injected header")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("upstream did not receive the headers")
+				}
+				ctx := <-tokenContext
+				revoke()
+				if ctx.Err() != context.Canceled {
+					t.Fatal("grant request context still live after revoke returned")
+				}
+				_, _ = io.WriteString(pw, "payload")
+				_ = pw.Close()
+				select {
+				case body := <-read:
+					if body != "" {
+						t.Errorf("upstream received %d body bytes after revoke", len(body))
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("upstream upload did not end")
+				}
+				<-done
+				if u := h.nextUse(); !u.Granted || !u.Injected || u.Err != "grant revoked" {
+					t.Errorf("Use %+v", u)
+				}
+			})
+		}
+	}
+}
+
+func TestRevokeAffectsOnlyInjectedGrants(t *testing.T) {
+	const placeholderGrant = "extra"
+	for _, tc := range []struct {
+		name        string
+		headers     []string
+		wantGranted bool
+	}{
+		{"own placeholder", []string{bearerInjection.value(placeholder)}, false},
+		{"other binding claimed header", []string{bearerInjection.value(placeholder), bearerInjection.value(placeholderGrant)}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			upstreamStarted := make(chan struct{})
+			ca := newTestCA(t)
+			up := startUpstream(t, ca, boundHost, func(w http.ResponseWriter, r *http.Request) {
+				close(upstreamStarted)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+			})
+			entered := make(chan context.Context, 1)
+			b := headerBinding(func(ctx context.Context) (string, error) {
+				entered <- ctx
+				return realToken, nil
+			})
+			other := headerBinding(staticToken(nil))
+			other.ID, other.Placeholder = "other", "other-placeholder"
+			h := startProxy(t, Config{Bindings: []Binding{b, other}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+			grantID := b.ID
+			if tc.wantGranted {
+				grantID = other.ID
+			}
+			revoke, err := h.proxy.Grant(grantID, placeholderGrant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := h.client(true, h.caPool)
+			req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/", nil)
+			req.Header["Authorization"] = tc.headers
+			done := make(chan error, 1)
+			go func() {
+				resp, err := client.Do(req)
+				if err == nil {
+					resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						err = fmt.Errorf("HTTP %d", resp.StatusCode)
+					}
+				}
+				done <- err
+			}()
+			select {
+			case <-upstreamStarted:
+				ctx := <-entered
+				revoke()
+				if err := ctx.Err(); err != nil {
+					t.Errorf("primary credential context: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("upstream request did not start")
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if u := h.nextUse(); u.Granted != tc.wantGranted || !u.Injected || u.Err != "" || u.BindingID != b.ID {
+				t.Fatalf("Use %+v", u)
+			}
+		})
+	}
+}
+
+func TestRevokeDuringResponse(t *testing.T) {
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ready")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	b := headerBinding(staticToken(nil))
+	second := Binding{ID: "key", Hosts: b.Hosts, Placeholder: "key-placeholder", Injects: []Injection{keyInjection}, Token: staticToken(nil)}
+	h := startProxy(t, Config{Bindings: []Binding{b, second}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	client := h.client(true, h.caPool)
+	for _, revokeID := range []string{b.ID, second.ID} {
+		t.Run(revokeID, func(t *testing.T) {
+			revokers := make(map[string]func())
+			req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/", nil)
+			for _, binding := range []Binding{b, second} {
+				ph := binding.ID + "-grant"
+				revoke, err := h.proxy.Grant(binding.ID, ph)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer revoke()
+				revokers[binding.ID] = revoke
+				form := binding.Injects[0]
+				req.Header.Set(form.headerName(), form.value(ph))
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			buf := make([]byte, len("ready"))
+			if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "ready" {
+				t.Fatalf("response prefix %q, error %v", buf, err)
+			}
+			revokers[revokeID]()
+			if u := h.nextUse(); !u.Granted || !u.Injected || u.Status != http.StatusOK || u.Err != "grant revoked" || u.BindingID != "github,key" {
+				t.Fatalf("Use %+v", u)
+			}
+		})
+	}
+}
+
+func TestConcurrentGrantLifetimes(t *testing.T) {
+	b := headerBinding(staticToken(nil))
+	p, err := New(Config{Bindings: []Binding{b}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ph := fmt.Sprintf("grant-%d", i)
+			for range 32 {
+				revoke, err := p.Grant(b.ID, ph)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := p.Grant(b.ID, ph); err == nil {
+					t.Error("duplicate live grant accepted")
+				}
+				revoke()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
 }
 
 func TestConnectHeaderLimit(t *testing.T) {
