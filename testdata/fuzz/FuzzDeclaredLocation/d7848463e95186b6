@@ -1,0 +1,2 @@
+go test fuzz v1
+string("BASIC eC1hY2Nlc3MtdG9rZW46cHJveHktc\rGxhY2Vob2xkZXItMDAwMQ==")
