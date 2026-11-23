@@ -12,13 +12,14 @@ Keeping the key in the proxy application reduces the places it can leak from.
 
 ## How it works
 
-1. The program puts a placeholder in the request header declared by a binding.
+1. The program puts a placeholder in a request header form that a binding declares.
 2. The HTTPS client opens a tunnel with `CONNECT` to the proxy.
 3. For a bound host on port 443, the proxy terminates client TLS using a certificate signed by a CA that `New` creates in memory.
-4. The proxy replaces an exact placeholder match in the binding's declared header with the credential.
-5. The proxy sends the request over a separate TLS connection and verifies the upstream certificate.
-6. For hosts without a binding, the proxy passes the tunnel's bytes through without decrypting them.
-7. With `ScanResponses` enabled, the proxy replaces reflected credentials in bound hosts' HTTP responses with their placeholders before sending the responses to the client.
+4. If the binding has a `Check` function, the proxy calls it. `Check` can refuse the request before the proxy gets the credential.
+5. The proxy replaces an exact placeholder match in the first matching header form with the credential.
+6. The proxy sends the request over a separate TLS connection and verifies the upstream certificate.
+7. For hosts without a binding, the proxy passes the tunnel's bytes through without decrypting them.
+8. With `ScanResponses` enabled, the proxy replaces reflected credentials in bound hosts' HTTP responses with the binding's placeholder before sending the responses to the client.
 
 ## Quick start
 
@@ -75,11 +76,11 @@ import (
 func Run(dir string, rootsPEM []byte, apiToken, gitToken, repo string) error {
 	bindings := []hostbound.Binding{
 		{ID: "API_TOKEN", Hosts: []string{"api.example.com"}, Placeholder: "api-placeholder",
-			Inject: hostbound.Injection{Header: "Authorization", Prefix: "Bearer "},
-			Token:  func(context.Context) (string, error) { return apiToken, nil }},
+			Injects: []hostbound.Injection{{Header: "Authorization", Prefix: "Bearer "}},
+			Token:   func(context.Context) (string, error) { return apiToken, nil }},
 		{ID: "GIT_TOKEN", Hosts: []string{"github.com"}, Placeholder: "git-placeholder",
-			Inject: hostbound.Injection{BasicUser: "x-access-token"},
-			Token:  func(context.Context) (string, error) { return gitToken, nil }},
+			Injects: []hostbound.Injection{{BasicUser: "x-access-token"}},
+			Token:   func(context.Context) (string, error) { return gitToken, nil }},
 	}
 	p, err := hostbound.New(hostbound.Config{Bindings: bindings, ScanResponses: true})
 	if err != nil {
@@ -111,6 +112,41 @@ Each binding ID names the child environment variable that receives its placehold
 Keep real credentials out of the rest of the child environment.
 Use `NewPlaceholder` to generate a random placeholder for a binding.
 
+## Checks and grants
+
+A binding's `Check` function runs before the proxy gets the credential.
+It receives the request and the placeholder that the request presented.
+If it returns an error, the proxy refuses the request and does not call `Token`.
+A `*Refusal` error sets the status, headers and body of the response.
+
+`Grant` gives a binding an extra placeholder until the caller revokes it.
+A `Check` function can then allow some requests only with a granted placeholder.
+For example, an application can give a command that a person approved its own placeholder, and refuse write requests that present the usual placeholder.
+
+```go
+// Inside Run, before hostbound.New: refuse methods other than GET and HEAD
+// unless the request presents a granted placeholder.
+git := &bindings[1]
+git.Check = func(r *http.Request, presented string) error {
+	if presented != git.Placeholder || r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return nil
+	}
+	return &hostbound.Refusal{Status: http.StatusForbidden, Body: []byte("write not approved\n"), Reason: "write not approved"}
+}
+
+// After hostbound.New: give one approved command its own placeholder.
+grant, err := hostbound.NewPlaceholder("GIT_TOKEN")
+if err != nil {
+	return err
+}
+revoke, err := p.Grant("GIT_TOKEN", grant)
+if err != nil {
+	return err
+}
+defer revoke()
+// Run the approved command with grant in place of the placeholder.
+```
+
 ## Client settings
 
 Set `HTTPS_PROXY` to the proxy URL. The CA bundle contains the system roots plus the proxy CA.
@@ -122,7 +158,7 @@ Set `HTTPS_PROXY` to the proxy URL. The CA bundle contains the system roots plus
 | Python 3.12 `requests` 2.31 | `REQUESTS_CA_BUNDLE` points to the bundle. |
 | Python 3.12 `urllib` | `SSL_CERT_FILE` points to the bundle. |
 | Go 1.26 `net/http` | The compatibility run supplied the roots through `tls.Config`. A stock client reads `SSL_CERT_FILE`. No test covers that path. |
-| git 2.43 | `GIT_SSL_CAINFO` points to the bundle. `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` configure a host-specific credential helper that returns the Basic user name and placeholder. |
+| git 2.43 | `GIT_SSL_CAINFO` points to the bundle. `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` configure a host-specific credential helper that returns the user name of the binding's first Basic form and the placeholder. |
 
 `ClientEnv` sets these environment variables, including the git helper variables for Basic-auth bindings.
 It also sets lowercase proxy variables and adds loopback addresses to `NO_PROXY` and `no_proxy`.
@@ -136,7 +172,7 @@ A client that ignores `HTTPS_PROXY` or pins the upstream certificate cannot use 
    The `CONNECT` target, the TLS server name (SNI) and each request's effective `Host` (or `:authority`) must name the same bound host.
    Use an origin-form or absolute-form request target.
    The proxy refuses opaque targets and nested `CONNECT` requests before fetching a token.
-   It substitutes the credential only when the declared header contains an exact match in the configured format.
+   It substitutes the credential only when one of the binding's declared header forms contains an exact match of its placeholder or a granted placeholder, and only after `Check` allows the request.
 2. **Response reflection.** With `ScanResponses` on, the proxy replaces matching credentials with placeholders in bound hosts' HTTP responses.
    It scans header names and values, interim responses, trailers and the body, including matches split across reads.
 3. **Destination addresses.** The default dialer never connects to addresses on its deny list.
@@ -147,15 +183,15 @@ A client that ignores `HTTPS_PROXY` or pins the upstream certificate cannot use 
 ## What it does not protect
 
 - Signing schemes that keep the key on the client, such as AWS SigV4 and HMAC, need a signer.
-- A credential in a query string or request body is outside the declared header location.
+- A credential in a query string or request body is outside the declared header forms.
 - Substitution works on HTTP requests. Protocols such as SSH, SMTP and PostgreSQL need their own credential handling.
 - A secret used inside the program, such as a file encryption key or a commit signing key, stays outside the proxy's scope. A binding also needs a named host.
 - Response scanning ends at a protocol upgrade. For example, WebSocket frames pass through unchanged.
 - An upstream can return a re-encoded credential, such as one with URL or JSON escapes. Response scanning matches credential representations it knows.
-- The program can call the API on bound hosts while it runs, with the permissions of the credential.
+- The program can call the API on bound hosts while it runs, with the permissions of the credential. A `Check` function can refuse some of those requests.
 - The scanner keeps a history of four recently used tokens per binding. Older rotated tokens can pass through on later requests. The proxy still scans each response for the token it sent with that request.
 - The proxy has no connection limit. Idle tunnels to unbound hosts have no timeout.
-- `Token` returns the current credential once per matching request and must honor the request context. `Close` can return while a callback that ignores cancellation is still running.
+- `Token` returns the current credential once per matching request that `Check` allows, and must honor the request context. `Close` can return while a callback that ignores cancellation is still running.
 - `Record` receives a `Use` record for each request to a bound host. The callback must return without blocking.
 - Go's HTTP transport can write upstream bytes to the process's default logger on an idle connection. Those bytes can contain a credential.
 - The CA's DNS name constraints also permit subdomains of bound names. The proxy issues leaf certificates only for exact bound names.
