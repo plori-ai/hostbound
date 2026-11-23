@@ -119,10 +119,11 @@ func applyGitHelpers(env []string, bindings []Binding) []string {
 	}
 	start := n
 	for _, b := range bindings {
-		if b.Inject.BasicUser == "" {
+		i := slices.IndexFunc(b.Injects, func(inj Injection) bool { return inj.BasicUser != "" })
+		if i < 0 {
 			continue
 		}
-		helper := "!f() { printf '%s\\n' " + shellQuote("username="+b.Inject.BasicUser) + " " + shellQuote("password="+b.Placeholder) + "; }; f"
+		helper := "!f() { printf '%s\\n' " + shellQuote("username="+b.Injects[i].BasicUser) + " " + shellQuote("password="+b.Placeholder) + "; }; f"
 		for _, host := range b.Hosts {
 			key := "credential.https://" + host + ".helper"
 			// An empty value tells git to discard helpers inherited for this host.

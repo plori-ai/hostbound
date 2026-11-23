@@ -2,6 +2,7 @@ package hostbound
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
@@ -148,7 +149,7 @@ func headerBinding(token func(context.Context) (string, error)) Binding {
 		ID:          "github",
 		Hosts:       []string{boundHost},
 		Placeholder: placeholder,
-		Inject:      Injection{Header: "Authorization", Prefix: "Bearer "},
+		Injects:     []Injection{bearerInjection},
 		Token:       token,
 	}
 }
@@ -158,7 +159,7 @@ func basicBinding(token func(context.Context) (string, error)) Binding {
 		ID:          "git",
 		Hosts:       []string{basicHost},
 		Placeholder: placeholder,
-		Inject:      Injection{BasicUser: basicUser},
+		Injects:     []Injection{basicInjection},
 		Token:       token,
 	}
 }
@@ -535,6 +536,55 @@ func TestInjection(t *testing.T) {
 	}
 }
 
+func TestBindingInjectionForms(t *testing.T) {
+	ca := newTestCA(t)
+	var calls atomic.Int32
+	b := headerBinding(staticToken(&calls))
+	b.Hosts = []string{basicHost, boundHost}
+	b.Injects = []Injection{basicInjection, tokenInjection, bearerInjection}
+	routes := map[string]string{}
+	for _, host := range b.Hosts {
+		up := startUpstream(t, ca, host, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, r.Header.Get("Authorization"))
+		})
+		routes[host+":443"] = up.srv.Listener.Addr().String()
+	}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, routes)
+	client := h.client(false, h.caPool)
+	for _, host := range b.Hosts {
+		for _, tc := range []struct{ name, input, want string }{
+			{"git", "Basic " + b64(basicUser+":"+placeholder), "Basic " + b64(basicUser+":"+realToken)},
+			{"gh", "token " + placeholder, "token " + realToken},
+			{"script", "Bearer " + placeholder, "Bearer " + realToken},
+			{"lowercase bearer", "bearer " + placeholder, "bearer " + placeholder},
+			{"extra space", "token  " + placeholder, "token  " + placeholder},
+			{"other basic user", "Basic " + b64("other:"+placeholder), "Basic " + b64("other:"+placeholder)},
+		} {
+			t.Run(host+"/"+tc.name, func(t *testing.T) {
+				before := calls.Load()
+				req, _ := http.NewRequest(http.MethodGet, "https://"+host+"/", nil)
+				req.Header.Set("Authorization", tc.input)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err != nil || string(body) != tc.want {
+					t.Fatalf("upstream received %q, want %q (read error %v)", body, tc.want, err)
+				}
+				injected := tc.input != tc.want
+				if u := h.nextUse(); u.Injected != injected || u.Status != http.StatusOK {
+					t.Fatalf("Use %+v", u)
+				}
+				if !injected && calls.Load() != before {
+					t.Fatal("fetched a token for an undeclared location")
+				}
+			})
+		}
+	}
+}
+
 func TestHopHeadersNotForwarded(t *testing.T) {
 	ca := newTestCA(t)
 	up := startUpstream(t, ca, boundHost, nil)
@@ -735,6 +785,8 @@ func TestScanResponses(t *testing.T) {
 			w.Header().Set("X-Echo", "token "+secret)
 		case "/body":
 			_, _ = io.WriteString(w, `{"token":"`+secret+`"}`)
+		case "/encodings":
+			_, _ = io.WriteString(w, secret+"|"+b64(basicUser+":"+secret)+"|"+b64("other:"+secret))
 		case "/split":
 			_, _ = io.WriteString(w, "a"+secret[:7])
 			w.(http.Flusher).Flush()
@@ -761,7 +813,9 @@ func TestScanResponses(t *testing.T) {
 		boundHost + ":443": up.srv.Listener.Addr().String(),
 		basicHost + ":443": upBasic.srv.Listener.Addr().String(),
 	}
-	h := startProxy(t, Config{Bindings: []Binding{headerBinding(staticToken(nil)), basicBinding(staticToken(nil))}, ScanResponses: true}, ca.pool, routes)
+	b := headerBinding(staticToken(nil))
+	b.Injects = append(b.Injects, basicInjection, Injection{BasicUser: "other"})
+	h := startProxy(t, Config{Bindings: []Binding{b, basicBinding(staticToken(nil))}, ScanResponses: true}, ca.pool, routes)
 	for _, http2 := range []bool{false, true} {
 		client := h.client(http2, h.caPool)
 		get := func(path, auth string) (*http.Response, string) {
@@ -782,6 +836,7 @@ func TestScanResponses(t *testing.T) {
 			path, auth, want string
 		}{
 			{"/body", bearer, `{"token":"` + placeholder + `"}`},
+			{"/encodings", bearer, placeholder + "|" + b64(basicUser+":"+placeholder) + "|" + b64("other:"+placeholder)},
 			{"/split", bearer, "a" + placeholder + "b"},
 			{"/gzip", bearer, "z:" + placeholder},
 			{"/body", "Bearer client-own", `{"token":"` + placeholder + `"}`},
@@ -949,9 +1004,14 @@ func TestNewValidation(t *testing.T) {
 		"IP host":          func(b *Binding) { b.Hosts = []string{"203.0.113.7"} },
 		"no placeholder":   func(b *Binding) { b.Placeholder = "" },
 		"no token":         func(b *Binding) { b.Token = nil },
-		"no injection":     func(b *Binding) { b.Inject = Injection{} },
-		"both injections":  func(b *Binding) { b.Inject.BasicUser = "u" },
-		"basic with colon": func(b *Binding) { b.Inject = Injection{BasicUser: "a:b"} },
+		"no forms":         func(b *Binding) { b.Injects = nil },
+		"empty form":       func(b *Binding) { b.Injects = []Injection{{}} },
+		"both injections":  func(b *Binding) { b.Injects = append(b.Injects, Injection{Header: "Authorization", BasicUser: "u"}) },
+		"basic with colon": func(b *Binding) { b.Injects = []Injection{{BasicUser: "a:b"}} },
+		"repeated form":    func(b *Binding) { b.Injects = append(b.Injects, bearerInjection) },
+		"repeated header form with different casing": func(b *Binding) {
+			b.Injects = append(b.Injects, Injection{Header: "authorization", Prefix: "Bearer "})
+		},
 	} {
 		b := ok
 		mutate(&b)
@@ -986,9 +1046,9 @@ func TestSharedHostBindings(t *testing.T) {
 		return func(context.Context) (string, error) { return v, nil }
 	}
 	bindings := []Binding{
-		{ID: "a", Hosts: []string{boundHost}, Placeholder: "ph-a", Inject: Injection{Header: "Authorization", Prefix: "Bearer "}, Token: token("real-a-41d2")},
-		{ID: "b", Hosts: []string{boundHost}, Placeholder: "ph-b", Inject: Injection{Header: "X-Api-Key"}, Token: token("real-b-9c41")},
-		{ID: "c", Hosts: []string{boundHost}, Placeholder: "ph-c", Inject: Injection{Header: "Authorization", Prefix: "Bearer "}, Token: token("real-c-7f3a")},
+		{ID: "a", Hosts: []string{boundHost}, Placeholder: "ph-a", Injects: []Injection{bearerInjection}, Token: token("real-a-41d2")},
+		{ID: "b", Hosts: []string{boundHost}, Placeholder: "ph-b", Injects: []Injection{bearerInjection, keyInjection}, Token: token("real-b-9c41")},
+		{ID: "c", Hosts: []string{boundHost}, Placeholder: "ph-c", Injects: []Injection{bearerInjection}, Token: token("real-c-7f3a")},
 	}
 	for _, tc := range []struct {
 		name              string
@@ -1001,6 +1061,8 @@ func TestSharedHostBindings(t *testing.T) {
 		{name: "different headers, one placeholder", key: "ph-b", wantKey: "real-b-9c41", wantBody: "|ph-b", wantID: "b", injected: true},
 		{name: "same header picks the exact match", auth: "Bearer ph-c", wantAuth: "Bearer real-c-7f3a", wantBody: "Bearer ph-c|", wantID: "c", injected: true},
 		{name: "request carrying both", auth: "Bearer ph-a", key: "ph-b", wantAuth: "Bearer real-a-41d2", wantKey: "real-b-9c41", wantBody: "Bearer ph-a|ph-b", wantID: "a,b", injected: true},
+		{name: "first matching form wins", auth: "Bearer ph-b", key: "ph-b", wantAuth: "Bearer real-b-9c41", wantKey: "ph-b", wantBody: "Bearer ph-b|ph-b", wantID: "b", injected: true},
+		{name: "first matching form already claimed", auth2: []string{"Bearer ph-a", "Bearer ph-b"}, key: "ph-b", wantAuth: "Bearer real-a-41d2", wantKey: "ph-b", wantBody: "Bearer ph-a|ph-b", wantID: "a", injected: true},
 		{name: "same header twice, first binding wins", auth2: []string{"Bearer ph-a", "Bearer ph-c"}, wantAuth: "Bearer real-a-41d2", wantBody: "Bearer ph-a|", wantID: "a", injected: true},
 		{name: "no placeholder", auth: "Bearer own", wantAuth: "Bearer own", wantBody: "Bearer own|", wantID: "a,b,c"},
 	} {
@@ -1107,6 +1169,367 @@ func TestCloseStopsServeAndTunnels(t *testing.T) {
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := br.ReadByte(); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("tunnel still open after Close: %v", err)
+	}
+}
+
+func TestCheckRefusal(t *testing.T) {
+	const grant = "command-placeholder"
+	headers := http.Header{"X-Policy": {"first", "second"}}
+	for _, tc := range []struct {
+		name         string
+		err          error
+		status       int
+		reason, body string
+	}{
+		{"custom", &Refusal{Status: 429, Header: headers, Reason: "quota", Body: []byte("slow\x00down")}, 429, "quota", "slow\x00down"},
+		{"minimum", &Refusal{Status: 400}, 400, "", ""},
+		{"maximum", &Refusal{Status: 499}, 499, "", ""},
+		{"zero", &Refusal{Body: []byte("declined")}, 403, "", "declined"},
+		{"below", &Refusal{Status: 399, Reason: "policy"}, 403, "policy", ""},
+		{"above", &Refusal{Status: 500, Reason: "policy"}, 403, "policy", ""},
+		{"generic", errors.New("private details"), 403, "refused", "Forbidden\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls, checks atomic.Int32
+			first := headerBinding(staticToken(&calls))
+			first.Check = func(_ *http.Request, presented string) error {
+				checks.Add(1)
+				if presented != first.Placeholder {
+					t.Errorf("first Check got %q", presented)
+				}
+				return nil
+			}
+			second := Binding{ID: "key", Hosts: first.Hosts, Placeholder: "key-placeholder", Injects: []Injection{keyInjection}, Token: staticToken(&calls)}
+			second.Check = func(_ *http.Request, presented string) error {
+				checks.Add(1)
+				if presented != grant {
+					t.Errorf("second Check got %q", presented)
+				}
+				return tc.err
+			}
+			ca := newTestCA(t)
+			up := startUpstream(t, ca, boundHost, nil)
+			h := startProxy(t, Config{Bindings: []Binding{first, second}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+			revoke, err := h.proxy.Grant(second.ID, grant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer revoke()
+			req, _ := http.NewRequest(http.MethodPost, "https://"+boundHost+"/path?private=value", nil)
+			req.Header.Set("Authorization", bearerInjection.value(placeholder))
+			req.Header.Set("X-Api-Key", grant)
+			resp, err := h.client(true, h.caPool).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != tc.status || string(body) != tc.body {
+				t.Fatalf("HTTP %d, body %q, read error %v", resp.StatusCode, body, err)
+			}
+			if tc.name == "custom" && !slices.Equal(resp.Header.Values("X-Policy"), headers["X-Policy"]) {
+				t.Errorf("refusal headers %v", resp.Header)
+			}
+			if u := h.nextUse(); u.Status != tc.status || u.Err != tc.reason || u.Injected || !u.Granted || u.BindingID != "github,key" || u.Path != "/path" || u.Method != http.MethodPost || u.Host != boundHost || u.At.IsZero() {
+				t.Errorf("Use %+v", u)
+			}
+			if checks.Load() != 2 || calls.Load() != 0 || h.dials.Load() != 0 || len(up.seen()) != 0 {
+				t.Errorf("Check calls %d, Token calls %d, upstream dials %d, upstream requests %d", checks.Load(), calls.Load(), h.dials.Load(), len(up.seen()))
+			}
+		})
+	}
+}
+
+func TestCheckOverlappingForms(t *testing.T) {
+	const grant = "command-placeholder"
+	var firstChecks, secondChecks, calls atomic.Int32
+	first := headerBinding(staticToken(&calls))
+	first.Injects = append(first.Injects, keyInjection)
+	first.Check = func(_ *http.Request, presented string) error {
+		firstChecks.Add(1)
+		if presented != first.Placeholder {
+			t.Errorf("first Check got %q", presented)
+		}
+		return &Refusal{Status: 409}
+	}
+	second := headerBinding(staticToken(&calls))
+	second.ID, second.Placeholder = "second", "second-placeholder"
+	second.Check = func(_ *http.Request, presented string) error {
+		secondChecks.Add(1)
+		if presented != second.Placeholder {
+			t.Errorf("second Check got %q", presented)
+		}
+		return nil
+	}
+	h := startProxy(t, Config{Bindings: []Binding{first, second}}, nil, map[string]string{})
+	revoke, err := h.proxy.Grant(first.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/", nil)
+	req.Header["Authorization"] = []string{bearerInjection.value(first.Placeholder), bearerInjection.value(second.Placeholder)}
+	req.Header.Set("X-Api-Key", grant)
+	resp, err := h.client(false, h.caPool).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if u := h.nextUse(); resp.StatusCode != 409 || !u.Granted || u.Injected || calls.Load() != 0 || firstChecks.Load() != 1 || secondChecks.Load() != 1 {
+		t.Fatalf("HTTP %d, Use %+v, Check calls %d/%d, Token calls %d", resp.StatusCode, u, firstChecks.Load(), secondChecks.Load(), calls.Load())
+	}
+}
+
+func TestCheckAfterTargetValidation(t *testing.T) {
+	var checks atomic.Int32
+	b := headerBinding(staticToken(nil))
+	b.Check = func(*http.Request, string) error {
+		checks.Add(1)
+		return errors.New("unexpected Check")
+	}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, nil, map[string]string{})
+	for _, tc := range []struct {
+		method, target, host string
+		want                 int
+	}{
+		{http.MethodConnect, boundHost + ":443", boundHost, 405},
+		{http.MethodGet, "mailto:user", boundHost, 400},
+		{http.MethodGet, "/", otherHost, 421},
+	} {
+		conn, err := h.tlsTunnel(boundHost+":443", boundHost, "http/1.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", tc.method, tc.target, tc.host, placeholder)
+		resp, _ := rawExchange(t, conn, req)
+		conn.Close()
+		if resp.StatusCode != tc.want || checks.Load() != 0 {
+			t.Errorf("%s %s: HTTP %d, Check calls %d", tc.method, tc.target, resp.StatusCode, checks.Load())
+		}
+	}
+}
+
+func TestCheckRestoresBody(t *testing.T) {
+	const payload = "before\x00after\n"
+	ca := newTestCA(t)
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		fmt.Fprintf(w, "%d %v %s", r.ContentLength, r.TransferEncoding, body)
+	}))
+	up.TLS = &tls.Config{Certificates: []tls.Certificate{ca.leaf(t, boundHost)}}
+	up.StartTLS()
+	t.Cleanup(up.Close)
+	var checks, calls atomic.Int32
+	b := headerBinding(staticToken(&calls))
+	b.Check = func(r *http.Request, presented string) error {
+		checks.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		if string(body) != payload || presented != placeholder {
+			t.Errorf("Check received body %q, placeholder %q", body, presented)
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.Listener.Addr().String()})
+	client := h.client(false, h.caPool)
+	for _, length := range []int64{int64(len(payload)), -1} {
+		req, _ := http.NewRequest(http.MethodPost, "https://"+boundHost+"/", strings.NewReader(payload))
+		req.ContentLength = length
+		req.Header.Set("Authorization", bearerInjection.value(placeholder))
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var encoding []string
+		if length == -1 {
+			encoding = []string{"chunked"}
+		}
+		want := fmt.Sprintf("%d %v %s", length, encoding, payload)
+		if err != nil || string(body) != want {
+			t.Fatalf("upstream framing and body %q, want %q, read error %v", body, want, err)
+		}
+		if u := h.nextUse(); !u.Injected || u.Granted || u.Status != http.StatusOK || u.Err != "" {
+			t.Fatalf("Use %+v", u)
+		}
+	}
+	if checks.Load() != 2 || calls.Load() != 2 {
+		t.Errorf("Check calls %d, Token calls %d", checks.Load(), calls.Load())
+	}
+}
+
+func TestGrantLifetime(t *testing.T) {
+	const grant = "command-placeholder"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.Header.Get("Authorization"))
+	})
+	var calls atomic.Int32
+	b := headerBinding(staticToken(&calls))
+	other := basicBinding(staticToken(nil))
+	other.Placeholder = "other-placeholder"
+	h := startProxy(t, Config{Bindings: []Binding{b, other}, ScanResponses: true}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	client := h.client(true, h.caPool)
+	revoke, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ id, value string }{
+		{"unknown", "unused"}, {other.ID, grant}, {b.ID, other.Placeholder}, {b.ID, ""}, {b.ID, placeholder}, {b.ID, grant},
+	} {
+		if _, err := h.proxy.Grant(tc.id, tc.value); err == nil {
+			t.Errorf("accepted invalid grant %q on %q", tc.value, tc.id)
+		}
+	}
+	check := func(method, value, want string, granted bool) {
+		t.Helper()
+		before := calls.Load()
+		req, _ := http.NewRequest(method, "https://"+boundHost+"/path", nil)
+		req.Header.Set("Authorization", "Bearer "+value)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		wantBody := "Bearer " + want
+		if want == realToken {
+			wantBody = "Bearer " + b.Placeholder
+		}
+		if err != nil || string(body) != wantBody {
+			t.Fatalf("response body %q, read error %v, want %q", body, err, wantBody)
+		}
+		use := h.nextUse()
+		if resp.StatusCode != 200 || use.Status != 200 || use.Err != "" || use.Granted != granted || use.Injected != (want == realToken) {
+			t.Fatalf("%s with %q: HTTP %d, Use %+v", method, value, resp.StatusCode, use)
+		}
+		seen := up.seen()
+		if len(seen) == 0 || seen[len(seen)-1].header.Get("Authorization") != "Bearer "+want {
+			t.Fatalf("upstream credential mismatch for %s with %q", method, value)
+		}
+		wantCalls := int32(0)
+		if want == realToken {
+			wantCalls = 1
+		}
+		if calls.Load()-before != wantCalls {
+			t.Fatalf("Token calls = %d, want %d", calls.Load()-before, wantCalls)
+		}
+	}
+
+	check("GET", placeholder, realToken, false)
+	check("GET", grant, realToken, true)
+	check("GET", other.Placeholder, other.Placeholder, false)
+	check("POST", grant, realToken, true)
+	revoke()
+	check("POST", grant, grant, false)
+	revokeAgain, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revokeAgain()
+	revoke()
+	check("POST", grant, realToken, true)
+	check("POST", placeholder, realToken, false)
+}
+
+func TestGrantDuringRequest(t *testing.T) {
+	const grant = "shared-grant"
+	ca := newTestCA(t)
+	first := headerBinding(staticToken(nil))
+	second := basicBinding(staticToken(nil))
+	up := startUpstream(t, ca, boundHost, nil)
+	other := startUpstream(t, ca, basicHost, nil)
+	var checks atomic.Int32
+	entered, resume := make(chan struct{}), make(chan struct{})
+	first.Check = func(r *http.Request, presented string) error {
+		checks.Add(1)
+		if presented != grant {
+			t.Errorf("Check received %q, want %q", presented, grant)
+		}
+		close(entered)
+		select {
+		case <-resume:
+			return nil
+		case <-r.Context().Done():
+			return r.Context().Err()
+		}
+	}
+	h := startProxy(t, Config{Bindings: []Binding{first, second}}, ca.pool, map[string]string{
+		boundHost + ":443": up.srv.Listener.Addr().String(), basicHost + ":443": other.srv.Listener.Addr().String(),
+	})
+	revoke, err := h.proxy.Grant(first.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := h.client(true, h.caPool)
+	request := func(host string, form Injection) error {
+		req, _ := http.NewRequest(http.MethodGet, "https://"+host+"/", nil)
+		req.Header.Set(form.headerName(), form.value(grant))
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return nil
+	}
+	if err := request(basicHost, basicInjection); err != nil {
+		t.Fatal(err)
+	}
+	if u := h.nextUse(); u.Granted || u.Injected {
+		t.Fatalf("grant matched on another binding: %+v", u)
+	}
+	done := make(chan error, 1)
+	go func() { done <- request(boundHost, bearerInjection) }()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("request returned before Check: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Check did not start")
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			revoke()
+		}()
+	}
+	wg.Wait()
+	revokeSecond, err := h.proxy.Grant(second.ID, grant)
+	close(resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revokeSecond()
+	revoke()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if u := h.nextUse(); !u.Granted || !u.Injected || checks.Load() != 1 {
+		t.Fatalf("in-flight request: %+v, Check calls %d", u, checks.Load())
+	}
+	if err := request(boundHost, bearerInjection); err != nil {
+		t.Fatal(err)
+	}
+	if u := h.nextUse(); u.Granted || u.Injected || checks.Load() != 1 {
+		t.Fatalf("revoked request: %+v, Check calls %d", u, checks.Load())
+	}
+	if err := request(basicHost, basicInjection); err != nil {
+		t.Fatal(err)
+	}
+	if u := h.nextUse(); !u.Granted || !u.Injected {
+		t.Fatalf("reassigned grant: %+v", u)
 	}
 }
 

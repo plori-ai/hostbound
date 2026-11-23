@@ -9,6 +9,7 @@ import (
 
 var (
 	bearerInjection = Injection{Header: "Authorization", Prefix: "Bearer "}
+	tokenInjection  = Injection{Header: "Authorization", Prefix: "token "}
 	basicInjection  = Injection{BasicUser: basicUser}
 	keyInjection    = Injection{Header: "x-api-key"}
 )
@@ -23,6 +24,9 @@ var locationSeeds = []string{
 	"Bearer " + placeholder + "x",
 	"Bearer " + placeholder[:len(placeholder)-1],
 	"Token " + placeholder,
+	"token " + placeholder,
+	"token  " + placeholder,
+	"Basic " + b64("other:"+placeholder),
 	placeholder,
 	"Basic " + b64(basicUser+":"+placeholder),
 	"basic " + b64(basicUser+":"+placeholder),
@@ -86,30 +90,31 @@ func FuzzDeclaredLocation(f *testing.F) {
 	for _, s := range locationSeeds {
 		f.Add(s)
 	}
+	b := binding{Binding: Binding{Placeholder: placeholder, Injects: []Injection{basicInjection, tokenInjection, bearerInjection, {BasicUser: "other"}}}}
 	f.Fuzz(func(t *testing.T, v string) {
-		if got, want := bearerInjection.matches(v, placeholder), v == "Bearer "+placeholder; got != want {
-			t.Fatalf("bearer match(%q) = %v", v, got)
+		scheme, encoded, _ := strings.Cut(v, " ")
+		isBasic := len(scheme) == len("Basic") && strings.EqualFold(scheme, "Basic")
+		var want string
+		switch {
+		case v == "Bearer "+placeholder:
+			want = "Bearer " + realToken
+		case v == "token "+placeholder:
+			want = "token " + realToken
+		case isBasic && encoded == b64(basicUser+":"+placeholder):
+			want = "Basic " + b64(basicUser+":"+realToken)
+		case isBasic && encoded == b64("other:"+placeholder):
+			want = "Basic " + b64("other:"+realToken)
 		}
-		basic := basicInjection.matches(v, placeholder)
-		if basic {
-			raw, err := base64.StdEncoding.DecodeString(v[len("Basic "):])
-			if err != nil || string(raw) != basicUser+":"+placeholder || !strings.EqualFold(v[:len("Basic ")], "Basic ") {
-				t.Fatalf("basic matched %q", v)
-			}
+		h := http.Header{"Authorization": {v}}
+		form, presented, _ := b.match(h)
+		ok := presented != ""
+		if ok != (want != "") {
+			t.Fatalf("match(%q) = %v, want injection %v", v, ok, want != "")
 		}
-		if (basic || bearerInjection.matches(v, placeholder)) && !strings.Contains(v, placeholder) && !strings.Contains(v, b64(basicUser+":"+placeholder)) {
-			t.Fatalf("matched %q without the placeholder", v)
-		}
-		for _, inj := range []Injection{bearerInjection, basicInjection} {
-			h := http.Header{}
-			h.Set(inj.headerName(), v)
-			if !inj.carries(h, placeholder) {
-				continue
-			}
-			inj.apply(h, realToken)
-			out := h.Get(inj.headerName())
-			if strings.Contains(out, placeholder) || out != inj.value(realToken) {
-				t.Fatalf("apply on %q gave %q", v, out)
+		if ok {
+			form.apply(h, realToken)
+			if got := h.Get("Authorization"); got != want {
+				t.Fatalf("injected %q for %q, want %q", got, v, want)
 			}
 		}
 	})

@@ -30,8 +30,32 @@ const (
 
 type binding struct {
 	Binding
+	grants map[string]bool // Guarded by proxy.grantsMu.
 	mu     sync.Mutex
 	recent []string
+}
+
+func (p *proxy) grant(bindingID, placeholder string) (func(), error) {
+	b := p.bindings[bindingID]
+	if b == nil {
+		return nil, fmt.Errorf("hostbound: unknown binding %q", bindingID)
+	}
+	if placeholder == "" {
+		return nil, errors.New("hostbound: grant placeholder is empty")
+	}
+	p.grantsMu.Lock()
+	defer p.grantsMu.Unlock()
+	for _, other := range p.bindings {
+		if placeholder == other.Placeholder || other.grants[placeholder] {
+			return nil, errors.New("hostbound: grant placeholder is already in use")
+		}
+	}
+	b.grants[placeholder] = true
+	return sync.OnceFunc(func() {
+		p.grantsMu.Lock()
+		defer p.grantsMu.Unlock()
+		delete(b.grants, placeholder)
+	}), nil
 }
 
 func (b *binding) remember(token string) {
@@ -53,9 +77,11 @@ func (b *binding) scanPairs(current string) []secretPair {
 	var pairs []secretPair
 	for _, t := range tokens {
 		pairs = append(pairs, secretPair{[]byte(t), []byte(b.Placeholder)})
-		if u := b.Inject.BasicUser; u != "" {
-			enc := base64.StdEncoding.EncodeToString
-			pairs = append(pairs, secretPair{[]byte(enc([]byte(u + ":" + t))), []byte(enc([]byte(u + ":" + b.Placeholder)))})
+		for _, inj := range b.Injects {
+			if u := inj.BasicUser; u != "" {
+				enc := base64.StdEncoding.EncodeToString
+				pairs = append(pairs, secretPair{[]byte(enc([]byte(u + ":" + t))), []byte(enc([]byte(u + ":" + b.Placeholder)))})
+			}
 		}
 	}
 	return pairs
@@ -63,6 +89,8 @@ func (b *binding) scanPairs(current string) []secretPair {
 
 type proxy struct {
 	cfg       Config
+	bindings  map[string]*binding
+	grantsMu  sync.RWMutex
 	hosts     map[string][]*binding
 	ca        *authority
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -80,24 +108,35 @@ type proxy struct {
 func newProxy(cfg Config) (*Proxy, error) {
 	p := &proxy{
 		cfg:       cfg,
+		bindings:  make(map[string]*binding),
 		hosts:     make(map[string][]*binding),
 		listeners: make(map[net.Listener]struct{}),
 		conns:     make(map[net.Conn]struct{}),
 	}
-	ids := make(map[string]bool)
 	var hosts []string
 	for _, b := range cfg.Bindings {
 		switch {
-		case b.ID == "" || ids[b.ID]:
+		case b.ID == "" || p.bindings[b.ID] != nil:
 			return nil, fmt.Errorf("hostbound: binding ID %q is empty or repeated", b.ID)
 		case b.Placeholder == "" || b.Token == nil || len(b.Hosts) == 0:
 			return nil, fmt.Errorf("hostbound: binding %q needs Hosts, Placeholder and Token", b.ID)
+		case len(b.Injects) == 0:
+			return nil, fmt.Errorf("hostbound: binding %q needs at least one injection form", b.ID)
 		}
-		if err := b.Inject.validate(); err != nil {
-			return nil, fmt.Errorf("hostbound: binding %q: %w", b.ID, err)
+		b.Injects = slices.Clone(b.Injects)
+		seen := make(map[Injection]bool)
+		for _, inj := range b.Injects {
+			if err := inj.validate(); err != nil {
+				return nil, fmt.Errorf("hostbound: binding %q: %w", b.ID, err)
+			}
+			inj.Header = http.CanonicalHeaderKey(inj.Header)
+			if seen[inj] {
+				return nil, fmt.Errorf("hostbound: binding %q repeats an injection form", b.ID)
+			}
+			seen[inj] = true
 		}
-		ids[b.ID] = true
-		bb := &binding{Binding: b}
+		bb := &binding{Binding: b, grants: make(map[string]bool)}
+		p.bindings[b.ID] = bb
 		for _, h := range b.Hosts {
 			n, port, ok := parseAuthority(h)
 			if _, err := netip.ParseAddr(h); !ok || port != "" || n != h || err == nil {
@@ -393,10 +432,35 @@ func closeWrite(c net.Conn) {
 }
 
 type exchange struct {
-	bs       []*binding
-	tokens   map[*binding]string
-	use      Use
-	recorded bool
+	bs         []*binding
+	injections map[*binding]matchedInjection
+	use        Use
+	recorded   bool
+}
+
+type matchedInjection struct {
+	form  Injection
+	token string
+}
+
+type presentedBinding struct {
+	b         *binding
+	form      Injection
+	presented string
+}
+
+func (p *proxy) match(x *exchange, h http.Header) []presentedBinding {
+	p.grantsMu.RLock()
+	defer p.grantsMu.RUnlock()
+	var matches []presentedBinding
+	for _, b := range x.bs {
+		form, presented, granted := b.match(h)
+		if presented != "" {
+			matches = append(matches, presentedBinding{b, form, presented})
+			x.use.Granted = x.use.Granted || granted
+		}
+	}
+	return matches
 }
 
 func bindingIDs(bs []*binding) string {
@@ -410,7 +474,7 @@ func bindingIDs(bs []*binding) string {
 func (x *exchange) scanPairs() []secretPair {
 	var pairs []secretPair
 	for _, b := range x.bs {
-		pairs = append(pairs, b.scanPairs(x.tokens[b])...)
+		pairs = append(pairs, b.scanPairs(x.injections[b].token)...)
 	}
 	return pairs
 }
@@ -429,6 +493,26 @@ func (x *exchange) fail(w http.ResponseWriter, code int, msg string) {
 	http.Error(w, http.StatusText(code), code)
 }
 
+func (x *exchange) refuse(w http.ResponseWriter, err error) {
+	refusal, ok := err.(*Refusal)
+	if !ok || refusal == nil {
+		x.fail(w, http.StatusForbidden, "refused")
+		return
+	}
+	status := refusal.Status
+	if status < 400 || status > 499 {
+		status = http.StatusForbidden
+	}
+	x.use.Status, x.use.Err = status, refusal.Reason
+	for name, values := range refusal.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(refusal.Body)
+}
+
 func authorityMatches(host string, r *http.Request) bool {
 	if !sameAuthority(host, r.Host) || (r.URL.Host != "" && !sameAuthority(host, r.URL.Host)) {
 		return false
@@ -443,7 +527,7 @@ func authorityMatches(host string, r *http.Request) bool {
 
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 	t := r.Context().Value(tunnelKey{}).(*tunnelConn)
-	x := &exchange{bs: t.bs, tokens: make(map[*binding]string), use: Use{BindingID: bindingIDs(t.bs), Host: t.host, Method: r.Method, Path: r.URL.Path, At: time.Now()}}
+	x := &exchange{bs: t.bs, injections: make(map[*binding]matchedInjection), use: Use{BindingID: bindingIDs(t.bs), Host: t.host, Method: r.Method, Path: r.URL.Path, At: time.Now()}}
 	defer p.finish(x)
 	switch {
 	case r.Method == http.MethodConnect:
@@ -456,13 +540,28 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 		x.fail(w, http.StatusMisdirectedRequest, "request authority does not match CONNECT host")
 		return
 	}
+	matches := p.match(x, r.Header)
+	var refusal error
+	for _, m := range matches {
+		if m.b.Check != nil {
+			if err := m.b.Check(r, m.presented); err != nil && refusal == nil {
+				refusal = err
+			}
+		}
+	}
+	if refusal != nil {
+		x.refuse(w, refusal)
+		return
+	}
 	var injected []*binding
 	headers := make(map[string]bool)
-	for _, b := range t.bs {
-		if headers[b.Inject.headerName()] || !b.Inject.carries(r.Header, b.Placeholder) {
+	for _, m := range matches {
+		header := m.form.headerName()
+		if headers[header] {
 			continue
 		}
-		headers[b.Inject.headerName()] = true
+		headers[header] = true
+		b := m.b
 		injected = append(injected, b)
 		token, err := b.Token(r.Context())
 		if err != nil || token == "" {
@@ -473,7 +572,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 		if p.cfg.ScanResponses {
 			b.remember(token)
 		}
-		x.tokens[b] = token
+		x.injections[b] = matchedInjection{m.form, token}
 	}
 	if len(injected) > 0 {
 		x.use.BindingID = bindingIDs(injected)
@@ -505,11 +604,9 @@ func (p *proxy) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.URL.User = nil
 	pr.Out.Host = x.use.Host
 	pr.Out.Header.Del("Host")
-	for _, b := range x.bs {
-		if token := x.tokens[b]; token != "" {
-			b.Inject.apply(pr.Out.Header, token)
-			x.use.Injected = true
-		}
+	for _, m := range x.injections {
+		m.form.apply(pr.Out.Header, m.token)
+		x.use.Injected = true
 	}
 	if p.cfg.ScanResponses {
 		pr.Out.Header.Set("Accept-Encoding", "identity")

@@ -1,11 +1,11 @@
 // Package hostbound provides an HTTPS forward proxy for clients that hold a
-// placeholder for a credential. A binding names the hosts and request header
+// placeholder for a credential. A binding names the hosts and request header forms
 // where the proxy may substitute the credential.
 //
 // For a bound host, the proxy accepts CONNECT on port 443 and terminates TLS
 // with a certificate issued by its in-memory CA. The CONNECT target, TLS SNI
-// and HTTP request authority must agree. Only an exact match in the declared
-// header triggers injection. The proxy verifies the upstream TLS certificate.
+// and HTTP request authority must agree. Only an exact match in a declared
+// header form triggers injection. The proxy verifies the upstream TLS certificate.
 // It tunnels connections to unbound hosts without decrypting them.
 //
 // With Config.ScanResponses enabled, the proxy replaces reflected credentials

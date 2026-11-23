@@ -35,7 +35,7 @@ func TestNewPlaceholder(t *testing.T) {
 
 func TestClientEnv(t *testing.T) {
 	api := Binding{ID: "MY_API_KEY", Hosts: []string{"api.example.com"}, Placeholder: "api-placeholder"}
-	git := Binding{ID: "GITHUB_PAT", Hosts: []string{"github.com", "api.github.com"}, Placeholder: "git-placeholder", Inject: Injection{BasicUser: "x-access-token"}}
+	git := Binding{ID: "GITHUB_PAT", Hosts: []string{"github.com", "api.github.com"}, Placeholder: "git-placeholder", Injects: []Injection{bearerInjection, {BasicUser: "x-access-token"}, {BasicUser: "other"}}}
 	env := []string{
 		"NO_PROXY=old.example", "NO_PROXY=internal.example, localhost", "no_proxy=svc.local",
 		"HTTPS_PROXY=http://user-proxy:3128",

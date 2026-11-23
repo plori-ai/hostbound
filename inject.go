@@ -7,6 +7,26 @@ import (
 	"strings"
 )
 
+func (b *binding) match(h http.Header) (form Injection, presented string, granted bool) {
+	for _, inj := range b.Injects {
+		if presented == "" && inj.carries(h, b.Placeholder) {
+			form, presented = inj, b.Placeholder
+			if len(b.grants) == 0 {
+				return form, presented, false
+			}
+		}
+		for grant := range b.grants {
+			if inj.carries(h, grant) {
+				if presented == "" {
+					return inj, grant, true
+				}
+				return form, presented, true
+			}
+		}
+	}
+	return form, presented, false
+}
+
 func (inj Injection) validate() error {
 	switch {
 	case inj.Header != "" && inj.BasicUser != "":

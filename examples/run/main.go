@@ -42,8 +42,8 @@ func run() error {
 		}
 		bindings = append(bindings, hostbound.Binding{
 			ID: name, Hosts: strings.Split(hosts, ","), Placeholder: placeholder,
-			Inject: hostbound.Injection{Header: "Authorization", Prefix: "Bearer "},
-			Token:  func(context.Context) (string, error) { return value, nil },
+			Injects: []hostbound.Injection{{Header: "Authorization", Prefix: "Bearer "}},
+			Token:   func(context.Context) (string, error) { return value, nil },
 		})
 		return nil
 	})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"net"
+	"net/http"
 	"net/netip"
 	"time"
 )
@@ -28,12 +29,35 @@ type Binding struct {
 	Hosts []string
 	// Placeholder is the nonempty value presented by the client.
 	Placeholder string
-	// Inject specifies the request header and authentication format.
-	Inject Injection
+	// Injects lists the request header forms that can carry a placeholder. The first
+	// form, in order, that carries Placeholder or a granted placeholder decides where
+	// the token goes. At least one form is required, and no form may repeat.
+	Injects []Injection
+	// Check, when set, runs for each request that carries one of the binding's
+	// placeholders, before Token. presented is the placeholder the request carried:
+	// Placeholder or a value passed to Grant. A non-nil error refuses the request. A
+	// *Refusal sets the response; any other error gives 403 Forbidden. Check may read
+	// r.Body only if it restores it.
+	Check func(r *http.Request, presented string) error
 	// Token returns the current real credential. It is called once per request
-	// that carries the placeholder in the declared location.
+	// that carries a placeholder in a declared form and passes Check.
 	Token func(ctx context.Context) (string, error)
 }
+
+// Refusal is an error that a Check returns to choose the response to a refused
+// request.
+type Refusal struct {
+	// Status is the HTTP status, 400 to 499. Zero means 403.
+	Status int
+	// Header is added to the response.
+	Header http.Header
+	// Body is the response body.
+	Body []byte
+	// Reason is recorded in Use.Err.
+	Reason string
+}
+
+func (e *Refusal) Error() string { return e.Reason }
 
 // Use is recorded once for every request to a bound host.
 type Use struct {
@@ -47,6 +71,8 @@ type Use struct {
 	Path string
 	// Injected reports whether the proxy sent a credential upstream.
 	Injected bool
+	// Granted reports whether the request carried a placeholder added by Grant.
+	Granted bool
 	// Status is the HTTP status, or zero if the TLS handshake failed.
 	Status int
 	// Err is an error category, empty on success.
@@ -86,6 +112,14 @@ func (p *Proxy) CACertPEM() []byte { return p.impl.caCertPEM() }
 
 // Serve accepts CONNECT requests on ln until Close.
 func (p *Proxy) Serve(ln net.Listener) error { return p.impl.serve(ln) }
+
+// Grant makes the binding accept placeholder in addition to its Placeholder until
+// revoke is called. placeholder must differ from every binding's Placeholder and
+// from every placeholder granted and not yet revoked. revoke can be called more
+// than once.
+func (p *Proxy) Grant(bindingID, placeholder string) (revoke func(), err error) {
+	return p.impl.grant(bindingID, placeholder)
+}
 
 // Close stops Serve and closes open connections.
 func (p *Proxy) Close() error { return p.impl.close() }
