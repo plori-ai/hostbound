@@ -106,13 +106,16 @@ func FuzzDeclaredLocation(f *testing.F) {
 			want = "Basic " + b64("other:"+realToken)
 		}
 		h := http.Header{"Authorization": {v}}
-		form, presented, _ := b.match(h)
-		ok := presented != ""
+		m, err := b.match(h, "/", "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ok := m.presented != ""
 		if ok != (want != "") {
 			t.Fatalf("match(%q) = %v, want injection %v", v, ok, want != "")
 		}
 		if ok {
-			form.apply(h, realToken)
+			m.form.apply(h, realToken)
 			if got := h.Get("Authorization"); got != want {
 				t.Fatalf("injected %q for %q, want %q", got, v, want)
 			}

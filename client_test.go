@@ -196,3 +196,35 @@ func TestChildProcesses(t *testing.T) {
 		}
 	})
 }
+
+func TestPythonPath(t *testing.T) {
+	ca := newTestCA(t)
+	for _, tc := range []struct{ name, host, path, token, want string }{
+		{"telegram", "telegram.example.test", "/bot" + placeholder + "/sendMessage", "123:example-token", "/bot123:example-token/sendMessage"},
+		{"discord", "discord.example.test", "/" + placeholder, "api/webhooks/123/example", "/api/webhooks/123/example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := startUpstream(t, ca, tc.host, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, r.RequestURI)
+			})
+			b := pathBinding(tc.token)
+			b.Hosts = []string{tc.host}
+			h := startProxy(t, Config{Bindings: []Binding{b}, ScanResponses: true}, ca.pool, map[string]string{tc.host + ":443": up.srv.Listener.Addr().String()})
+			caFile, bundle, err := h.proxy.WriteCAFiles(t.TempDir(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "python3", "-I", "-B", "-c",
+				"import sys, urllib.request; sys.stdout.buffer.write(urllib.request.urlopen(sys.argv[1]).read())", "https://"+tc.host+tc.path)
+			cmd.Env = ClientEnv(nil, "http://"+h.addr, caFile, bundle, []Binding{b})
+			if out, err := cmd.CombinedOutput(); err != nil || string(out) != tc.path {
+				t.Fatalf("urllib returned %q, error %v", out, err)
+			}
+			if seen := up.seen(); len(seen) != 1 || seen[0].path != tc.want {
+				t.Fatalf("upstream requests %+v, want path %q", seen, tc.want)
+			}
+		})
+	}
+}

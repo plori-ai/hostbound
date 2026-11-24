@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -134,6 +135,7 @@ func newProxy(cfg Config) (*Proxy, error) {
 			return nil, fmt.Errorf("hostbound: binding %q needs at least one injection form", b.ID)
 		}
 		b.Injects = slices.Clone(b.Injects)
+		b.PathPrefixes = slices.Clone(b.PathPrefixes)
 		seen := make(map[Injection]bool)
 		for _, inj := range b.Injects {
 			if err := inj.validate(); err != nil {
@@ -444,6 +446,7 @@ func closeWrite(c net.Conn) {
 type exchange struct {
 	bs             []*binding
 	injections     map[*binding]matchedInjection
+	path           *url.URL
 	grants         []grant
 	grantCtx       context.Context
 	cancel         context.CancelCauseFunc
@@ -462,24 +465,33 @@ type presentedBinding struct {
 	form      Injection
 	presented string
 	inject    bool
+	granted   bool
+	multiple  bool
+	edits     []pathEdit
 }
 
-func (p *proxy) match(x *exchange, r *http.Request, w http.ResponseWriter) []presentedBinding {
+func (p *proxy) match(x *exchange, r *http.Request, w http.ResponseWriter) ([]presentedBinding, error) {
 	p.grantsMu.Lock()
 	defer p.grantsMu.Unlock()
 	var matches []presentedBinding
 	headers := make(map[string]bool)
 	for _, b := range x.bs {
-		form, presented, granted := b.match(r.Header)
-		if presented == "" {
+		m, err := b.match(r.Header, x.use.Path, r.URL.Path)
+		if err != nil {
+			return nil, err
+		}
+		if m.presented == "" {
 			continue
 		}
-		header := form.headerName()
-		inject := !headers[header]
-		headers[header] = true
-		matches = append(matches, presentedBinding{b, form, presented, inject})
-		x.use.Granted = x.use.Granted || granted
-		if g := b.grants[presented]; inject && g != nil {
+		m.inject = allowsPath(b.PathPrefixes, x.use.Path)
+		if m.inject && !m.form.Path {
+			header := m.form.headerName()
+			m.inject = !headers[header]
+			headers[header] = true
+		}
+		matches = append(matches, m)
+		x.use.Granted = x.use.Granted || m.granted
+		if g := b.grants[m.presented]; m.inject && g != nil {
 			if x.grantCtx == nil {
 				x.grantCtx, x.cancel = context.WithCancelCause(r.Context())
 				if r.Body != nil && r.Body != http.NoBody {
@@ -490,7 +502,7 @@ func (p *proxy) match(x *exchange, r *http.Request, w http.ResponseWriter) []pre
 			x.grants = append(x.grants, g)
 		}
 	}
-	return matches
+	return matches, nil
 }
 
 func bindingIDs(bs []*binding) string {
@@ -576,7 +588,11 @@ func authorityMatches(host string, r *http.Request) bool {
 
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 	t := r.Context().Value(tunnelKey{}).(*tunnelConn)
-	x := &exchange{bs: t.bs, injections: make(map[*binding]matchedInjection), use: Use{BindingID: bindingIDs(t.bs), Host: t.host, Method: r.Method, Path: r.URL.Path, At: time.Now()}}
+	path := r.URL.RawPath
+	if path == "" {
+		path = r.URL.EscapedPath()
+	}
+	x := &exchange{bs: t.bs, injections: make(map[*binding]matchedInjection), use: Use{BindingID: bindingIDs(t.bs), Host: t.host, Method: r.Method, Path: path, At: time.Now()}}
 	defer p.finish(x)
 	switch {
 	case r.Method == http.MethodConnect:
@@ -589,7 +605,16 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 		x.fail(w, http.StatusMisdirectedRequest, "request authority does not match CONNECT host")
 		return
 	}
-	matches := p.match(x, r, w)
+	matches, err := p.match(x, r, w)
+	if err != nil {
+		x.fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	edits, err := selectedPathEdits(matches)
+	if err != nil {
+		x.fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if x.grantCtx != nil {
 		r = r.WithContext(x.grantCtx)
 	}
@@ -624,6 +649,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 			x.fail(w, http.StatusBadGateway, "token unavailable")
 			return
 		}
+		if m.form.Path && strings.Trim(token, pathTokenChars) != "" {
+			x.fail(w, http.StatusBadGateway, "invalid path token")
+			return
+		}
 		if p.cfg.ScanResponses {
 			b.remember(token)
 		}
@@ -631,6 +660,19 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(injected) > 0 {
 		x.use.BindingID = bindingIDs(injected)
+	}
+	path = r.URL.EscapedPath()
+	if len(edits) > 0 {
+		raw := applyPathEdits(x.use.Path, edits, x.injections)
+		decoded, _ := url.PathUnescape(raw)
+		x.path = &url.URL{RawPath: raw, Path: decoded}
+		path = x.path.EscapedPath()
+	}
+	for _, b := range injected {
+		if !allowsPath(b.PathPrefixes, path) {
+			x.fail(w, http.StatusForbidden, "injected path outside binding")
+			return
+		}
 	}
 	if p.cfg.ScanResponses {
 		w = interimScanner{ResponseWriter: w, x: x}
@@ -659,8 +701,13 @@ func (p *proxy) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.URL.User = nil
 	pr.Out.Host = x.use.Host
 	pr.Out.Header.Del("Host")
+	if x.path != nil {
+		pr.Out.URL.RawPath, pr.Out.URL.Path = x.path.RawPath, x.path.Path
+	}
 	for _, m := range x.injections {
-		m.form.apply(pr.Out.Header, m.token)
+		if !m.form.Path {
+			m.form.apply(pr.Out.Header, m.token)
+		}
 		x.use.Injected = true
 	}
 	if p.cfg.ScanResponses {

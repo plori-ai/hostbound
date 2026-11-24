@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -98,6 +99,7 @@ type seenRequest struct {
 	proto  int
 	host   string
 	header http.Header
+	path   string
 	query  string
 	body   string
 }
@@ -120,7 +122,7 @@ func startUpstream(t *testing.T, ca *testCA, host string, h http.HandlerFunc) *u
 	u.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		u.mu.Lock()
-		u.reqs = append(u.reqs, seenRequest{proto: r.ProtoMajor, host: r.Host, header: r.Header.Clone(), query: r.URL.RawQuery, body: string(body)})
+		u.reqs = append(u.reqs, seenRequest{proto: r.ProtoMajor, host: r.Host, header: r.Header.Clone(), path: r.URL.EscapedPath(), query: r.URL.RawQuery, body: string(body)})
 		u.mu.Unlock()
 		if h != nil {
 			h(w, r)
@@ -136,7 +138,7 @@ func startUpstream(t *testing.T, ca *testCA, host string, h http.HandlerFunc) *u
 }
 
 type harness struct {
-	t      *testing.T
+	t      testing.TB
 	proxy  *Proxy
 	addr   string
 	caPool *x509.CertPool
@@ -173,7 +175,7 @@ func staticToken(calls *atomic.Int32) func(context.Context) (string, error) {
 	}
 }
 
-func startProxy(t *testing.T, cfg Config, roots *x509.CertPool, routes map[string]string) *harness {
+func startProxy(t testing.TB, cfg Config, roots *x509.CertPool, routes map[string]string) *harness {
 	t.Helper()
 	h := &harness{t: t, uses: make(chan Use, 64)}
 	cfg.UpstreamRoots = roots
@@ -732,6 +734,11 @@ func TestUpstreamCertificateVerified(t *testing.T) {
 }
 
 func TestUpstreamErrorTextNeverCarriesToken(t *testing.T) {
+	const pathToken = "api/webhooks/test/secret-example"
+	var logs strings.Builder
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
 	ca := newTestCA(t)
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{ca.leaf(t, boundHost)}, NextProtos: []string{"http/1.1"}})
 	if err != nil {
@@ -750,12 +757,14 @@ func TestUpstreamErrorTextNeverCarriesToken(t *testing.T) {
 				if err != nil {
 					return
 				}
-				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nBroken header "+r.Header.Get("Authorization")+"\r\n\r\n")
+				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nBroken header "+r.Header.Get("Authorization")+" "+r.URL.EscapedPath()+"\r\n\r\n")
 			}()
 		}
 	}()
-	h := startProxy(t, Config{Bindings: []Binding{headerBinding(staticToken(nil))}}, ca.pool, map[string]string{boundHost + ":443": ln.Addr().String()})
-	req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/x", nil)
+	path := pathBinding(pathToken)
+	path.ID = "webhook"
+	h := startProxy(t, Config{Bindings: []Binding{headerBinding(staticToken(nil)), path}}, ca.pool, map[string]string{boundHost + ":443": ln.Addr().String()})
+	req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/"+placeholder, nil)
 	req.Header.Set("Authorization", "Bearer "+placeholder)
 	resp, err := h.client(false, h.caPool).Do(req)
 	if err != nil {
@@ -763,11 +772,17 @@ func TestUpstreamErrorTextNeverCarriesToken(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(body), realToken) {
+	if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(body), realToken) || strings.Contains(string(body), pathToken) {
 		t.Fatalf("status %d body %q", resp.StatusCode, body)
 	}
-	if u := h.nextUse(); u.Err != "upstream request failed" {
+	u := h.nextUse()
+	visible := fmt.Sprint(u, resp.Header)
+	if u.Err != "upstream request failed" || u.Path != "/"+placeholder || !u.Injected || strings.Contains(visible, pathToken) || strings.Contains(visible, realToken) {
 		t.Fatalf("Use %+v", u)
+	}
+	log.SetOutput(previous)
+	if strings.Contains(logs.String(), pathToken) || strings.Contains(logs.String(), realToken) {
+		t.Error("proxy logged a credential")
 	}
 }
 
@@ -1006,6 +1021,10 @@ func TestNewValidation(t *testing.T) {
 		"no token":         func(b *Binding) { b.Token = nil },
 		"no forms":         func(b *Binding) { b.Injects = nil },
 		"empty form":       func(b *Binding) { b.Injects = []Injection{{}} },
+		"path with header": func(b *Binding) { b.Injects = []Injection{{Path: true, Header: "X-Key"}} },
+		"path with basic":  func(b *Binding) { b.Injects = []Injection{{Path: true, BasicUser: "u"}} },
+		"path with prefix": func(b *Binding) { b.Injects = []Injection{{Path: true, Prefix: "Bearer "}} },
+		"repeated path":    func(b *Binding) { b.Injects = []Injection{{Path: true}, {Path: true}} },
 		"both injections":  func(b *Binding) { b.Injects = append(b.Injects, Injection{Header: "Authorization", BasicUser: "u"}) },
 		"basic with colon": func(b *Binding) { b.Injects = []Injection{{BasicUser: "a:b"}} },
 		"repeated form":    func(b *Binding) { b.Injects = append(b.Injects, bearerInjection) },
@@ -1169,6 +1188,597 @@ func TestCloseStopsServeAndTunnels(t *testing.T) {
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := br.ReadByte(); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("tunnel still open after Close: %v", err)
+	}
+}
+
+func pathBinding(token string) Binding {
+	return Binding{
+		ID: "path", Hosts: []string{boundHost}, Placeholder: placeholder, Injects: []Injection{{Path: true}},
+		Token: func(context.Context) (string, error) { return token, nil },
+	}
+}
+
+func TestPathInjection(t *testing.T) {
+	const tok = "12345:Example_-.~9"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	for _, tc := range []struct {
+		name, target, token, wantPath, wantErr string
+	}{
+		{"telegram", "/bot" + placeholder + "/sendMessage", tok, "/bot" + tok + "/sendMessage", ""},
+		{"discord", "/" + placeholder, "api/webhooks/id/example", "/api/webhooks/id/example", ""},
+		{"all literal occurrences", "/a%3ab/" + placeholder + "/" + placeholder, tok, "/a%3ab/" + tok + "/" + tok, ""},
+		{"query only", "/x?q=" + placeholder, tok, "/x", ""},
+		{"path and query", "/" + placeholder + "?q=" + placeholder, tok, "/" + tok, ""},
+		{"encoded placeholder", "/%70" + placeholder[1:], tok, "", "encoded path placeholder"},
+		{"literal and partly encoded", "/" + placeholder + "/p%72" + placeholder[2:], tok, "", "encoded path placeholder"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startProxy(t, Config{Bindings: []Binding{pathBinding(tc.token)}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+			before := len(up.seen())
+			req, err := http.NewRequest(http.MethodGet, "https://"+boundHost+tc.target, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+placeholder)
+			resp, err := h.client(false, h.caPool).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			u := h.nextUse()
+			if u.Path != req.URL.EscapedPath() || u.Err != tc.wantErr || u.Injected != strings.Contains(tc.wantPath, tc.token) {
+				t.Fatalf("Use %+v", u)
+			}
+			seen := up.seen()[before:]
+			if tc.wantErr != "" {
+				if resp.StatusCode != http.StatusBadRequest || len(seen) != 0 {
+					t.Fatalf("status %d, forwarded %d requests", resp.StatusCode, len(seen))
+				}
+				return
+			}
+			if len(seen) != 1 || seen[0].path != tc.wantPath || seen[0].query != req.URL.RawQuery || seen[0].header.Get("Authorization") != "Bearer "+placeholder {
+				t.Fatalf("forwarded %+v, want path %q", seen, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestUnsafePathToken(t *testing.T) {
+	for _, c := range []string{"%", "?", "#", " ", "\r", "\n", "\\", "@", "+", "&", ";", "=", "é"} {
+		t.Run(fmt.Sprintf("%x", c), func(t *testing.T) {
+			h := startProxy(t, Config{Bindings: []Binding{pathBinding("example" + c + "token")}}, nil, map[string]string{})
+			resp, err := h.client(false, h.caPool).Get("https://" + boundHost + "/" + placeholder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			u := h.nextUse()
+			if u.Err != "invalid path token" || u.Injected || u.Path != "/"+placeholder || resp.StatusCode != http.StatusBadGateway || h.dials.Load() != 0 {
+				t.Fatalf("Use %+v, dials %d", u, h.dials.Load())
+			}
+		})
+	}
+}
+
+func TestPathFormOrder(t *testing.T) {
+	const grant = "granted-command"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	path := Injection{Path: true}
+	for _, tc := range []struct {
+		name                 string
+		forms                []Injection
+		path, header         string
+		wantPath, wantHeader string
+	}{
+		{"path first", []Injection{path, bearerInjection}, grant, placeholder, realToken, placeholder},
+		{"header first", []Injection{bearerInjection, path}, grant, placeholder, grant, realToken},
+		{"path only matches", []Injection{bearerInjection, path}, grant, "other", realToken, "other"},
+		{"header only matches", []Injection{path, bearerInjection}, "other", grant, "other", realToken},
+		{"grant in later header", []Injection{path, bearerInjection}, placeholder, grant, realToken, grant},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := pathBinding(realToken)
+			b.Injects = tc.forms
+			h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+			revoke, err := h.proxy.Grant(b.ID, grant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer revoke()
+			req, _ := http.NewRequest(http.MethodGet, "https://"+boundHost+"/"+tc.path, nil)
+			req.Header.Set("Authorization", bearerInjection.value(tc.header))
+			before := len(up.seen())
+			resp, err := h.client(false, h.caPool).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if seen := up.seen()[before:]; len(seen) != 1 || seen[0].path != "/"+tc.wantPath || seen[0].header.Get("Authorization") != bearerInjection.value(tc.wantHeader) {
+				t.Fatalf("upstream requests %+v", seen)
+			}
+			if u := h.nextUse(); !u.Granted || !u.Injected || u.Path != "/"+tc.path {
+				t.Fatalf("Use %+v", u)
+			}
+		})
+	}
+}
+
+func TestOverlappingPathPlaceholders(t *testing.T) {
+	for _, tc := range []struct {
+		name, base, other, grant, path string
+	}{
+		{"self", "aba", "", "", "/ababa"},
+		{"identical bindings", "abc", "abc", "", "/abc"},
+		{"partial bindings", "abc", "bcd", "", "/abcd"},
+		{"grant contains base", "abc", "", "zabc", "/zabc"},
+		{"grant and other binding", "unused", "bcd", "abc", "/abcd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := pathBinding(realToken)
+			b.Placeholder = tc.base
+			bs := []Binding{b}
+			if tc.other != "" {
+				other := pathBinding("other-token")
+				other.ID, other.Placeholder = "other", tc.other
+				bs = append(bs, other)
+			}
+			h := startProxy(t, Config{Bindings: bs}, nil, map[string]string{})
+			if tc.grant != "" {
+				revoke, err := h.proxy.Grant(b.ID, tc.grant)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer revoke()
+			}
+			resp, err := h.client(true, h.caPool).Get("https://" + boundHost + tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if u := h.nextUse(); resp.StatusCode != http.StatusBadRequest || u.Err != "overlapping path placeholders" || u.Injected || h.dials.Load() != 0 {
+				t.Fatalf("status %d, Use %+v, dials %d", resp.StatusCode, u, h.dials.Load())
+			}
+		})
+	}
+}
+
+func TestDistinctPathPresentations(t *testing.T) {
+	b := pathBinding(realToken)
+	b.Check = func(*http.Request, string) error {
+		t.Error("Check received only one of the request's two distinct placeholders")
+		return nil
+	}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, nil, map[string]string{})
+	const grant = "command-grant"
+	revoke, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	resp, err := h.client(true, h.caPool).Get("https://" + boundHost + "/" + grant + "/" + b.Placeholder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if u := h.nextUse(); u.Err != "multiple distinct path placeholders for binding" || u.Injected || resp.StatusCode != http.StatusBadRequest || h.dials.Load() != 0 {
+		t.Fatalf("HTTP %d, Use %+v, dials %d", resp.StatusCode, u, h.dials.Load())
+	}
+}
+
+func TestPathGrant(t *testing.T) {
+	const grant = "command-grant"
+	b := pathBinding(realToken)
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	revoke, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	client := h.client(true, h.caPool)
+	for _, tc := range []struct {
+		path, want, reason string
+		revoked            bool
+	}{
+		{"/" + grant + "/" + grant, "/" + realToken + "/" + realToken, "", false},
+		{"/%63" + grant[1:], "", "encoded path placeholder", false},
+		{"/" + grant, "/" + grant, "", true},
+	} {
+		if tc.revoked {
+			revoke()
+		}
+		before := len(up.seen())
+		resp, err := client.Get("https://" + boundHost + tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		u := h.nextUse()
+		if u.Err != tc.reason || u.Path != tc.path || u.Injected != strings.Contains(tc.want, realToken) {
+			t.Fatalf("Use %+v for %q", u, tc.path)
+		}
+		seen := up.seen()[before:]
+		if tc.reason != "" {
+			if len(seen) != 0 || resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("forwarded encoded grant: status %d, upstream %+v", resp.StatusCode, seen)
+			}
+		} else if u.Granted != u.Injected || len(seen) != 1 || seen[0].path != tc.want {
+			t.Fatalf("Use %+v, upstream %+v", u, seen)
+		}
+	}
+}
+
+func TestCheckPath(t *testing.T) {
+	const grant = "command-grant"
+	b := pathBinding(realToken)
+	b.Token = func(context.Context) (string, error) {
+		t.Error("Token called after refusal")
+		return "", nil
+	}
+	b.Check = func(r *http.Request, presented string) error {
+		want := "/bot" + presented + "/send"
+		if r.URL.EscapedPath() != want || r.URL.Path != want || r.RequestURI != want {
+			t.Errorf("Check got %q for URL %q and request target %q", presented, r.URL, r.RequestURI)
+		}
+		reason := "write refused for " + r.URL.EscapedPath()
+		return &Refusal{Status: http.StatusForbidden, Reason: reason, Body: []byte(reason)}
+	}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, nil, map[string]string{})
+	revoke, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	client := h.client(true, h.caPool)
+	for _, ph := range []string{b.Placeholder, grant} {
+		resp, err := client.Get("https://" + boundHost + "/bot" + ph + "/send")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		want := "write refused for /bot" + ph + "/send"
+		u := h.nextUse()
+		if err != nil || string(body) != want || strings.Contains(fmt.Sprint(u, resp.Header, string(body), err), realToken) {
+			t.Fatalf("refused response %+v, body %q, read error %v, Use %+v", resp.Header, body, err, u)
+		}
+		if u.Err != want || u.Injected || u.Granted != (ph == grant) || resp.StatusCode != http.StatusForbidden || h.dials.Load() != 0 {
+			t.Fatalf("status %d, Use %+v, dials %d", resp.StatusCode, u, h.dials.Load())
+		}
+	}
+}
+
+func TestPathFailureRecords(t *testing.T) {
+	const path = "/v4/spreadsheets/" + placeholder
+	for _, tc := range []struct {
+		name, token, prefix, reason string
+		err                         error
+		status                      int
+	}{
+		{"lookup error", realToken, path, "token unavailable", errors.New("cannot fetch " + realToken), http.StatusBadGateway},
+		{"invalid token", realToken + "%", path, "invalid path token", nil, http.StatusBadGateway},
+		{"after substitution", realToken, path, "injected path outside binding", nil, http.StatusForbidden},
+		{"token adds dot segment", "../" + realToken, "/v4/spreadsheets", "injected path outside binding", nil, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := pathBinding(tc.token)
+			b.PathPrefixes = []string{tc.prefix}
+			b.Token = func(context.Context) (string, error) { return tc.token, tc.err }
+			h := startProxy(t, Config{Bindings: []Binding{b}, ScanResponses: true}, nil, map[string]string{})
+			resp, err := h.client(false, h.caPool).Get("https://" + boundHost + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			u := h.nextUse()
+			if err != nil || strings.Contains(fmt.Sprint(u, resp.Status, resp.Header, string(body), err), realToken) {
+				t.Fatalf("HTTP %s, headers %v, body %q, read error %v, Use %+v", resp.Status, resp.Header, body, err, u)
+			}
+			if resp.StatusCode != tc.status || u.Err != tc.reason || u.Path != path || u.Injected || h.dials.Load() != 0 {
+				t.Fatalf("HTTP %d, Use %+v, dials %d", resp.StatusCode, u, h.dials.Load())
+			}
+		})
+	}
+}
+
+func TestRevokePathGrant(t *testing.T) {
+	const grant = "command-grant"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, func(w http.ResponseWriter, r *http.Request) {
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	b := pathBinding(realToken)
+	h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	revoke, err := h.proxy.Grant(b.ID, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	resp, err := h.client(true, h.caPool).Get("https://" + boundHost + "/" + grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if seen := up.seen(); len(seen) != 1 || seen[0].path != "/"+realToken {
+		t.Fatalf("upstream requests %+v", seen)
+	}
+	revoke()
+	if u := h.nextUse(); !u.Granted || !u.Injected || u.Err != "grant revoked" || u.Path != "/"+grant {
+		t.Fatalf("Use %+v", u)
+	}
+}
+
+func TestPathPrefixes(t *testing.T) {
+	const sheet = "/v4/spreadsheets/A"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	for _, form := range []string{"header", "basic", "path"} {
+		t.Run(form, func(t *testing.T) {
+			b := headerBinding(staticToken(nil))
+			if form == "path" {
+				b = pathBinding(realToken)
+			} else if form == "basic" {
+				b.Injects = []Injection{basicInjection}
+			}
+			b.PathPrefixes = []string{"/other", sheet}
+			h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+			client := h.client(true, h.caPool)
+			for _, tc := range []struct {
+				target string
+				want   bool
+			}{
+				{sheet, true}, {sheet + "?fields=title", true}, {sheet + ":batchUpdate", true},
+				{sheet + "/values/Sheet%201!A1:append", true}, {"/other/" + placeholder, true},
+				{sheet + "/values/" + placeholder, true}, {sheet + ":" + placeholder, true},
+				{sheet + "B/" + placeholder, false}, {sheet + "%3F/" + placeholder, false}, {"/before" + sheet + "/" + placeholder, false},
+				{sheet + "/./" + placeholder, false}, {sheet + "/x/../" + placeholder, false}, {sheet + "/..", false},
+				{sheet + "/x%2fy/" + placeholder, false}, {sheet + "/x%2Fy/" + placeholder, false},
+				{sheet + "/x%2ey/" + placeholder, false}, {sheet + "/%2E/" + placeholder, false},
+				{sheet + "/version.1/" + placeholder + "?q=%2F%2E", true},
+			} {
+				req, err := http.NewRequest(http.MethodGet, "https://"+boundHost+tc.target, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Authorization", "Bearer "+placeholder)
+				if form == "basic" {
+					req.SetBasicAuth(basicUser, placeholder)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+				u := h.nextUse()
+				want := tc.want && (form != "path" || strings.Contains(req.URL.EscapedPath(), placeholder))
+				seen := up.seen()
+				got := seen[len(seen)-1]
+				sent := strings.Contains(got.path, realToken) || bearerInjection.carries(got.header, realToken) || basicInjection.carries(got.header, realToken)
+				if u.Path != req.URL.EscapedPath() || u.Injected != want || sent != want {
+					t.Errorf("%s: injected %t, upstream path %q header %q, want %t", tc.target, u.Injected, got.path, got.header.Get("Authorization"), want)
+				}
+			}
+		})
+	}
+}
+
+func TestPathBeforeURLEscaping(t *testing.T) {
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	b := pathBinding(realToken)
+	b.PathPrefixes = []string{"/sheet"}
+	h := startProxy(t, Config{Bindings: []Binding{b}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	for _, tc := range []struct {
+		target string
+		status int
+		reason string
+	}{
+		{"/sheet/|/%70" + placeholder[1:], http.StatusBadRequest, "encoded path placeholder"},
+		{"/sheet/|/%2F/" + placeholder, http.StatusOK, ""},
+		{"/sheet/|/%2e/" + placeholder, http.StatusOK, ""},
+	} {
+		c, err := h.tlsTunnel(boundHost+":443", boundHost, "http/1.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := len(up.seen())
+		resp, _ := rawExchange(t, c, "GET "+tc.target+" HTTP/1.1\r\nHost: "+boundHost+"\r\nConnection: close\r\n\r\n")
+		c.Close()
+		if u := h.nextUse(); resp.StatusCode != tc.status || u.Injected || u.Path != tc.target || u.Err != tc.reason {
+			t.Fatalf("HTTP %d, Use %+v", resp.StatusCode, u)
+		}
+		seen := up.seen()[before:]
+		if (tc.reason != "" && len(seen) != 0) || (tc.reason == "" && (len(seen) != 1 || strings.Contains(seen[0].path, realToken))) {
+			t.Fatalf("upstream requests %+v for %q", seen, tc.target)
+		}
+	}
+}
+
+func TestPathRedirect(t *testing.T) {
+	const token = "api/webhooks/123/test-token"
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://"+otherHost+r.URL.EscapedPath())
+		w.WriteHeader(http.StatusFound)
+		_, _ = io.WriteString(w, r.URL.EscapedPath())
+	})
+	other := startUpstream(t, ca, otherHost, nil)
+	h := startProxy(t, Config{Bindings: []Binding{pathBinding(token)}, ScanResponses: true}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String(), otherHost + ":443": other.srv.Listener.Addr().String()})
+	h.caPool.AddCert(ca.cert)
+	client := h.client(false, h.caPool)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Get("https://" + boundHost + "/" + placeholder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	location := resp.Header.Get("Location")
+	if err != nil || resp.StatusCode != http.StatusFound || string(body) != "/"+placeholder || location != "https://"+otherHost+"/"+placeholder || len(other.seen()) != 0 {
+		t.Fatalf("redirect %d location %q body %q, err %v", resp.StatusCode, location, body, err)
+	}
+	if u := h.nextUse(); !u.Injected || u.Path != "/"+placeholder || up.seen()[0].path != "/"+token {
+		t.Fatalf("request or record mismatch: %+v", u)
+	}
+	resp, err = client.Get(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if seen := other.seen(); len(seen) != 1 || seen[0].path != "/"+placeholder {
+		t.Fatalf("redirect target received %+v", seen)
+	}
+	h.noUse()
+}
+
+func FuzzPathInjection(f *testing.F) {
+	const prefix = "/v4/spreadsheets/A"
+	const exact = "/mounted/" + placeholder
+	const tok = "123:fake-path-token"
+	const bound, unbound = "example.com", "other.example.com"
+	for _, raw := range []string{
+		prefix + "/" + placeholder, prefix + ":" + placeholder, prefix + "B/" + placeholder,
+		prefix + "/../" + placeholder, prefix + "/x%2Fy/" + placeholder, prefix + "/x%3Ay/" + placeholder,
+		prefix + "/%70" + placeholder[1:], "/outside/%70" + placeholder[1:], prefix + "/" + placeholder + "/" + placeholder,
+		exact, exact + "/values", prefix + "/%2e/" + placeholder,
+		prefix + "/../B/" + placeholder, prefix + "/%2e%2e/B/" + placeholder, prefix + "/%2E/" + placeholder,
+		prefix + "%2f../B/" + placeholder, prefix + "/..%2FB/" + placeholder,
+		prefix + "/.%2E/B/" + placeholder, prefix + "/%2e.%2fB/" + placeholder, prefix + "/%2E%2e%2FB/" + placeholder,
+	} {
+		f.Add(raw, true)
+		f.Add(raw, false)
+	}
+	roots := x509.NewCertPool()
+	routes := make(map[string]string)
+	for _, host := range []string{bound, unbound} {
+		up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Host != host {
+				http.Error(w, "wrong host", http.StatusMisdirectedRequest)
+				return
+			}
+			w.Header().Set("X-Upstream-Host", host)
+			_, _ = io.WriteString(w, r.URL.RequestURI())
+		}))
+		f.Cleanup(up.Close)
+		roots.AddCert(up.Certificate())
+		routes[host+":443"] = up.Listener.Addr().String()
+	}
+	b := pathBinding(tok)
+	b.Hosts = []string{bound}
+	b.PathPrefixes = []string{prefix, exact}
+	h := startProxy(f, Config{Bindings: []Binding{b}}, roots, routes)
+	roots = roots.Clone()
+	roots.AppendCertsFromPEM(h.proxy.CACertPEM())
+	client := h.client(false, roots)
+	f.Fuzz(func(t *testing.T, raw string, onBound bool) {
+		u, err := url.ParseRequestURI(raw)
+		if err != nil || !strings.HasPrefix(raw, "/") || strings.Contains(u.Path, tok) {
+			return
+		}
+		path := u.EscapedPath()
+		host := unbound
+		if onBound {
+			host = bound
+		}
+		target := path + "?q=" + placeholder
+		resp, err := client.Get("https://" + host + target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var use Use
+		if onBound {
+			select {
+			case use = <-h.uses:
+			case <-time.After(5 * time.Second):
+				t.Fatal("missing Use")
+			}
+			if use.Path != path || strings.Contains(use.Path, tok) {
+				t.Fatalf("recorded path %q for %q", use.Path, path)
+			}
+		}
+		allowed := func(path string) bool {
+			segments := strings.Split(path, "/")
+			lower := strings.ToLower(path)
+			if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") || slices.Contains(segments, ".") || slices.Contains(segments, "..") {
+				return false
+			}
+			for _, p := range b.PathPrefixes {
+				if path == p || strings.HasPrefix(path, p+"/") || strings.HasPrefix(path, p+":") {
+					return true
+				}
+			}
+			return false
+		}
+		if onBound && strings.Count(u.Path, placeholder) != strings.Count(path, placeholder) {
+			if use.Injected || use.Err != "encoded path placeholder" || resp.Header.Get("X-Upstream-Host") != "" {
+				t.Fatalf("encoded placeholder forwarded for %q", raw)
+			}
+			return
+		}
+		want := target
+		if onBound && allowed(path) {
+			forwarded := strings.ReplaceAll(path, placeholder, tok)
+			if !allowed(forwarded) {
+				if use.Injected || use.Err != "injected path outside binding" || resp.Header.Get("X-Upstream-Host") != "" {
+					t.Fatalf("out-of-scope substitution forwarded for %q", raw)
+				}
+				return
+			}
+			want = forwarded + "?q=" + placeholder
+		}
+		forwarded, _, _ := strings.Cut(string(body), "?")
+		if strings.Contains(forwarded, tok) && (resp.Header.Get("X-Upstream-Host") != bound || !allowed(forwarded)) {
+			t.Fatalf("token reached host %q path %q", resp.Header.Get("X-Upstream-Host"), forwarded)
+		}
+		if gotHost := resp.Header.Get("X-Upstream-Host"); gotHost != host || string(body) != want || use.Injected != strings.Contains(want, tok) {
+			t.Fatalf("upstream host %q target %q, want %q %q, injected %t", gotHost, body, host, want, use.Injected)
+		}
+	})
+}
+
+func TestSharedPathBindings(t *testing.T) {
+	ca := newTestCA(t)
+	up := startUpstream(t, ca, boundHost, nil)
+	first := pathBinding("other-placeholder")
+	second := pathBinding("example/second")
+	second.ID, second.Placeholder = "second", "other-placeholder"
+	scoped := headerBinding(staticToken(nil))
+	scoped.ID, scoped.PathPrefixes = "sheet", []string{"/spreadsheets/" + placeholder}
+	h := startProxy(t, Config{Bindings: []Binding{first, second, scoped}}, ca.pool, map[string]string{boundHost + ":443": up.srv.Listener.Addr().String()})
+	client := h.client(false, h.caPool)
+	path := "/" + second.Placeholder + "/" + first.Placeholder
+	resp, err := client.Get("https://" + boundHost + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	u := h.nextUse()
+	if seen := up.seen(); len(seen) != 1 || seen[0].path != "/example/second/other-placeholder" || u.BindingID != "path,second" || !u.Injected || u.Path != path {
+		t.Fatalf("upstream %+v Use %+v", seen, u)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://"+boundHost+"/spreadsheets/"+placeholder, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+scoped.Placeholder)
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	u = h.nextUse()
+	if resp.StatusCode != http.StatusForbidden || u.Err != "injected path outside binding" || u.Injected || len(up.seen()) != 1 {
+		t.Fatalf("scope after substitution: status %d Use %+v", resp.StatusCode, u)
 	}
 }
 

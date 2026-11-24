@@ -19,6 +19,8 @@ type Injection struct {
 	// BasicUser: the Authorization header must be Basic with this user name and the
 	// placeholder as password; the proxy sends the same user name with the token.
 	BasicUser string
+	// Path replaces literal placeholders in the escaped request path when this is the first matching form and takes no Header, Prefix or BasicUser.
+	Path bool
 }
 
 // Binding ties one credential to the hosts it may be sent to; bindings may share a host.
@@ -29,10 +31,12 @@ type Binding struct {
 	Hosts []string
 	// Placeholder is the nonempty value presented by the client.
 	Placeholder string
-	// Injects lists the request header forms that can carry a placeholder. The first
+	// Injects lists the request forms that can carry a placeholder. The first
 	// form, in order, that carries Placeholder or a granted placeholder decides where
 	// the token goes. At least one form is required, and no form may repeat.
 	Injects []Injection
+	// PathPrefixes, when set, limit every form to escaped paths equal to a prefix or continuing with '/' or ':'.
+	PathPrefixes []string
 	// Check, when set, runs for each request that carries one of the binding's
 	// placeholders, before Token. presented is the placeholder the request carried:
 	// Placeholder or a value passed to Grant. A non-nil error refuses the request. A
@@ -67,7 +71,7 @@ type Use struct {
 	Host string
 	// Method is the HTTP method.
 	Method string
-	// Path is the URL path without the query string.
+	// Path is the client's escaped URL path before substitution, without the query string.
 	Path string
 	// Injected reports whether the proxy sent a credential upstream.
 	Injected bool
